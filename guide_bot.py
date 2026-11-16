@@ -4,8 +4,9 @@ Guide-бот для Roblox (метро-тайкун): сам берёт зада
 к соседней. Если нужная станция спрятана под окном задания - сам сдвигает карту.
 
 Запуск:   python guide_bot.py
-Клавиши:  F8  - пауза / продолжить
-          F10 - выход
+Клавиши:  P - пауза / продолжить
+          O - выход
+          (срабатывают, когда активно окно игры или окно бота; F8 / F10 работают везде)
 Опции:    --count N     выполнить N заданий и выйти (по умолчанию без ограничения)
           --once        то же, что --count 1
           --cooldown N  пауза после пройденного задания в секундах (по умолчанию 10)
@@ -13,7 +14,7 @@ Guide-бот для Roblox (метро-тайкун): сам берёт зада
 
 Требования: Windows, Python 3.10+, pip install opencv-python mss numpy
 Игра должна быть открыта (окно бот развернёт сам), карта - с одной веткой метро.
-Пока бот работает, мышь занята: не двигай её и не переключай окно (или поставь паузу F8).
+Пока бот работает, мышь занята: не двигай её и не переключай окно (или поставь паузу клавишей P).
 """
 from __future__ import annotations
 
@@ -61,6 +62,20 @@ class INPUT(ctypes.Structure):
 
 M_MOVE, M_ABS, M_VDESK, M_LDOWN, M_LUP = 0x0001, 0x8000, 0x4000, 0x0002, 0x0004
 VK_F8, VK_F10, VK_MENU = 0x77, 0x79, 0x12
+VK_P, VK_O = 0x50, 0x4F          # пауза и выход
+CONSOLE = ctypes.windll.kernel32.GetConsoleWindow()
+
+
+def hotkey(game_hwnd, vk, vk_anywhere):
+    """Нажата ли клавиша управления. P и O считаются только в окне игры или бота,
+    чтобы бот не останавливался, когда ты печатаешь в другом приложении."""
+    # 0x8000 - клавиша зажата сейчас, 1 - её нажали с прошлой проверки (ловит короткие нажатия)
+    if user32.GetAsyncKeyState(vk_anywhere) & 0x8001:
+        return True
+    if user32.GetAsyncKeyState(vk) & 0x8001:
+        fg = user32.GetForegroundWindow()
+        return bool(fg) and fg in (game_hwnd, CONSOLE)
+    return False
 
 
 class Stop(Exception):
@@ -117,9 +132,9 @@ class Game:
                     log("Окно Roblox найдено")
                 return
             if not told:
-                log("Жду окно Roblox - запусти игру (F10 - выход)")
+                log("Жду окно Roblox - запусти игру (O - выход)")
                 told = True
-            if user32.GetAsyncKeyState(VK_F10) & 0x8000:
+            if hotkey(None, VK_O, VK_F10):
                 raise Stop
             time.sleep(0.5)
 
@@ -159,13 +174,13 @@ class Game:
 
     # ---- управление ----
     def check(self):
-        """Обработка F8/F10 и потери фокуса. Вызывается во всех ожиданиях."""
-        if user32.GetAsyncKeyState(VK_F10) & 0x8000:
+        """Обработка клавиш паузы / выхода. Вызывается во всех ожиданиях."""
+        if hotkey(self.hwnd, VK_O, VK_F10):
             raise Stop
-        down = bool(user32.GetAsyncKeyState(VK_F8) & 0x8000)
+        down = hotkey(self.hwnd, VK_P, VK_F8)
         if down and not self._f8:
             self.paused = not self.paused
-            log("ПАУЗА (F8 - продолжить)" if self.paused else "Продолжаю")
+            log("ПАУЗА (P - продолжить)" if self.paused else "Продолжаю")
         self._f8 = down
         return not self.paused
 
@@ -189,7 +204,7 @@ class Game:
             if ok and self.focused():
                 return
             if ok and not warned:
-                log("Окно Roblox не активно - жду (кликни по игре или нажми F10 для выхода)")
+                log("Окно Roblox не активно - жду (кликни по игре; O в окне бота - выход)")
                 warned = True
             time.sleep(0.1)
 
@@ -212,6 +227,7 @@ class Game:
         cx, cy = self.cursor()
         n = max(1, int(max(abs(x - cx), abs(y - cy)) / step))
         for i in range(1, n + 1):
+            self.check()      # клавиши паузы / выхода ловим и во время движения мыши
             self.move(round(cx + (x - cx) * i / n), round(cy + (y - cy) * i / n))
             time.sleep(delay)
 
@@ -1016,7 +1032,7 @@ class Bot:
 
     def run(self):
         self.prepare_window()
-        log("Бот запущен. F8 - пауза / продолжить, F10 - выход.")
+        log("Бот запущен. P - пауза / продолжить, O - выход.")
         self.unknown = 0           # сколько проверок подряд экран не узнан
         self.unknown_at = None     # с какого времени
         self.tries = 0             # попыток на текущее задание
@@ -1148,8 +1164,9 @@ BANNER = r"""
   ================================================
      GUIDE BOT  -  авто-маршруты для задания Guide
   ================================================
-   F8  - пауза / продолжить
-   F10 - выход
+   P - пауза / продолжить
+   O - выход
+   (клавиши работают, когда активно окно игры)
    Не двигай мышь, пока бот работает (или ставь паузу).
 """
 
@@ -1170,7 +1187,7 @@ def main():
         except Exception:
             pass
     k32 = ctypes.windll.kernel32
-    k32.SetConsoleTitleW("Guide Bot  |  F8 - пауза, F10 - выход")
+    k32.SetConsoleTitleW("Guide Bot  |  P - пауза, O - выход")
     k32.CreateMutexW(None, False, "GuideBot_single_instance")
     if k32.GetLastError() == 183:      # уже запущен: два бота дрались бы за мышь
         print("Guide Bot уже запущен в другом окне.")
