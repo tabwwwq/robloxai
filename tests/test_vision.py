@@ -179,6 +179,20 @@ class VisionTests(unittest.TestCase):
                 self.assertIsNone(plan.error)
                 np.testing.assert_allclose(plan.route, expected, atol=1)
 
+    def test_route_does_not_bypass_big_gold_station(self):
+        # Днём кружок Sovetskaya рвёт бледную линию на 20 px, и путь огибал его в 10 px
+        # от центра: бот тянул Pobeda -> Sportivnaya, игра не принимала - 20 минут неудач.
+        img = load_image("samara_gold_station_skipped.png")
+        _, hdr = bot.ui_state(img)
+        view = bot.View(img, hdr)
+        route = [(1140, 548), (982, 548), (823, 548), (665, 548)]
+        for expected in (route, route[::-1]):
+            with self.subTest(start=expected[0]):
+                plan = bot.make_plan(img, expected[0], expected[-1], view.stations,
+                                     bot.CITIES["samara"]["line"], view.rects)
+                self.assertIsNone(plan.error)
+                np.testing.assert_allclose(plan.route, expected, atol=2)
+
 
 class PinAndCityTests(unittest.TestCase):
     def test_pin_points_at_the_station_under_the_ring(self):
@@ -313,6 +327,26 @@ class BelgianCoastTests(unittest.TestCase):
         np.testing.assert_allclose(view.G, (715.5, 549.5), atol=3)
         np.testing.assert_allclose(view.R, (916, 348), atol=3)
         self.assertTrue(bot.Bot.stations_too_small(view))
+
+    def test_line_under_top_panel_is_not_cut_short(self):
+        # Снимок пользователя (Nieuwpoort), вставленный в кадр 1920x1009 на своё место.
+        # Жёлтая линия протяжки стёрта: так карта выглядела, когда бот строил маршрут.
+        # Victorlaan и Bad - под зоной верхних панелей, поэтому их нет среди станций.
+        # Раньше путь искался только возле видимых станций, срезал по пустой карте,
+        # и бот тянул Cardijnlaan -> Sint Bernardusplein - игра такой перегон не принимала.
+        img = load_image("belgian_nieuwpoort_under_panel.png")
+        view = bot.View(img, None)
+        np.testing.assert_allclose(view.cur, (1146, 306), atol=2)
+        for hidden in ((1061, 233), (956, 222)):         # Victorlaan, Bad
+            self.assertFalse(any(np.hypot(s[0] - hidden[0], s[1] - hidden[1]) < 10 for s in view.stations))
+        plan = bot.make_plan(img, view.cur, (768, 422), view.stations,
+                             bot.CITIES["belgian"]["line"], view.rects)
+        self.assertIsNone(plan.error)
+        for hidden in ((1061, 233), (956, 222)):         # путь идёт по линии через них
+            self.assertLess(np.hypot(plan.path[:, 0] - hidden[0], plan.path[:, 1] - hidden[1]).min(), 10)
+        legs, trouble = bot.ready_legs(plan, view, True)
+        self.assertEqual(legs, 0)                        # сначала сдвинуть карту, а не тянуть
+        self.assertLess(trouble[1], 245)
 
     def test_no_start_or_goal_ring_without_task(self):
         for name in self.ROUTES:

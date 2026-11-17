@@ -685,10 +685,18 @@ class Plan:
         self.error = None
 
 
-def make_plan(img, src, goal, stations, known_cols=()):
+PLAN_F = 3            # шаг сетки поиска пути, px
+PLAN_PAD = 40         # клеток сетки за краем экрана: линия может уйти за край и вернуться
+COST_LINE, COST_HIDDEN, COST_EMPTY = 1.0, 6.0, 25.0
+
+
+def make_plan(img, src, goal, stations, known_cols=(), rects=()):
     """Маршрут вдоль линии метро от src до goal через найденные кружки станций.
     known_cols - цвета линии с прошлых кадров этого задания: когда большая часть маршрута
-    уже пройдена, на кадре остаётся мало станций и определить цвет заново не всегда удаётся."""
+    уже пройдена, на кадре остаётся мало станций и определить цвет заново не всегда удаётся.
+    rects - интерфейс поверх карты. Под ним и за краем экрана линию не видно, поэтому путь
+    там дешевле, чем по пустой карте: пусть лучше пройдёт под панелью (бот сдвинет карту
+    и посмотрит), чем срежет напрямую мимо спрятанных станций - такой перегон игра не примет."""
     p = Plan()
     p.stations = stations
     h, w = img.shape[:2]
@@ -707,31 +715,55 @@ def make_plan(img, src, goal, stations, known_cols=()):
         return p
     p.cols = cols
     lm = cv2.dilate(line_mask(img, cols), np.ones((3, 3), np.uint8))
-    f = 3
-    xs = [s[0] for s in stations] + [a[0], b[0]]
-    ys = [s[1] for s in stations] + [a[1], b[1]]
-    x0, x1 = int(min(w - 2, max(0, min(xs) - 60))), int(max(2, min(w, max(xs) + 60)))
-    y0, y1 = int(min(h - 2, max(0, min(ys) - 60))), int(max(2, min(h, max(ys) + 60)))
-    sub = lm[y0:y1, x0:x1]
-    small = cv2.resize(sub, (max(1, sub.shape[1] // f), max(1, sub.shape[0] // f)),
-                       interpolation=cv2.INTER_AREA) > 0
-    cost = np.where(small, 1.0, 25.0)
+    # Кружок станции рвёт линию (золотой - на 20 px и больше), и путь мог обогнуть его
+    # по соседней надписи, пройдя мимо станции. Станции стоят на линии - считаем их её частью.
+    for cx, cy, r in stations:
+        cv2.circle(lm, (int(round(cx)), int(round(cy))), int(math.ceil(r)) + 2, 255, -1)
+    # Ищем по всему кадру. Раньше поиск шёл только в рамке вокруг видимых станций, и когда
+    # часть линии со станциями уходила под верхнюю панель (Belgian Coast, Nieuwpoort), путь
+    # срезал по пустой карте прямо к дальней станции. Дейкстра останавливается на цели,
+    # а дорогую пустую карту почти не обходит, так что весь кадр - это быстро.
+    f, pad = PLAN_F, PLAN_PAD
+    gw, gh = max(1, w // f), max(1, h // f)
+    small = cv2.resize(lm, (gw, gh), interpolation=cv2.INTER_AREA) > 0
+    hidden = np.zeros((gh, gw), bool)
+    for rx0, ry0, rx1, ry1 in rects:
+        hidden[max(0, int(ry0 // f)):max(0, int(ry1 // f) + 1), max(0, int(rx0 // f)):max(0, int(rx1 // f) + 1)] = True
+    cost = np.full((gh + 2 * pad, gw + 2 * pad), COST_HIDDEN)
+    cost[pad:pad + gh, pad:pad + gw] = np.where(small, COST_LINE, np.where(hidden, COST_HIDDEN, COST_EMPTY))
     sh, sw = cost.shape
 
     def to_s(pt):
-        return (min(sw - 1, max(0, int((pt[0] - x0) / f))), min(sh - 1, max(0, int((pt[1] - y0) / f))))
+        return (min(sw - 1, max(0, int(pt[0] // f) + pad)), min(sh - 1, max(0, int(pt[1] // f) + pad)))
 
     path = shortest_path(cost, to_s(a), to_s(b))
     if not path:
         p.error = "не нашёл путь по линии"
         return p
-    pts = np.array([(x0 + (x + 0.5) * f, y0 + (y + 0.5) * f) for x, y in path])
+    pts = np.array([((x - pad + 0.5) * f, (y - pad + 0.5) * f) for x, y in path])
     p.path = pts
+    # точки пути на видимой карте: под интерфейсом и за краем экрана станций не ищем
+    vis = np.array([0 <= x - pad < gw and 0 <= y - pad < gh and not hidden[y - pad, x - pad]
+                    for x, y in path])
     on = []
-    for cx, cy, _ in stations:
+    lm_wide = cv2.dilate(lm, np.ones((5, 5), np.uint8))
+
+    def joined(cx, cy, i):
+        """От станции до точки пути i - сплошная линия, без пустой карты."""
+        n = int(math.hypot(pts[i][0] - cx, pts[i][1] - cy)) + 2
+        xs = np.clip(np.round(np.linspace(cx, pts[i][0], n)).astype(int), 0, w - 1)
+        ys = np.clip(np.round(np.linspace(cy, pts[i][1], n)).astype(int), 0, h - 1)
+        return bool(lm_wide[ys, xs].all())
+
+    for cx, cy, r in stations:
         d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
         i = int(d.argmin())
-        if d[i] <= 9:
+        # По толстой линии (уже пройденный участок, крупный масштаб) путь идёт краем
+        # и на изгибе срезает угол - мимо центра станции. Станция всё равно на маршруте,
+        # если от неё до пути - сама линия, а не пустая карта (надпись рядом не подойдёт).
+        # Только сбоку от пути: за его концами (за Goal) на линии бывают окна поездов.
+        if d[i] <= max(9, r + 3) or (d[i] <= 14 and 0 < i < len(pts) - 1 and vis[i]
+                                     and joined(cx, cy, i)):
             on.append((i, cx, cy))
     # Страховка: станции должны идти строго по одной, пропускать нельзя. Поэтому ещё раз
     # проходим вдоль самой линии и ищем кружки, которые общий поиск мог не узнать.
@@ -739,7 +771,7 @@ def make_plan(img, src, goal, stations, known_cols=()):
         for cx, cy, _ in find_light_stations(img, loose=True, refs=(a, b)):
             d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
             i = int(d.argmin())
-            if d[i] <= 5 and all(math.hypot(cx - o[1], cy - o[2]) > 10 for o in on):
+            if d[i] <= 5 and vis[i] and all(math.hypot(cx - o[1], cy - o[2]) > 10 for o in on):
                 on.append((i, cx, cy))
         dm = np.zeros(img.shape[:2], np.uint8)
     else:
@@ -754,7 +786,7 @@ def make_plan(img, src, goal, stations, known_cols=()):
     run = []
     for i, (px, py) in enumerate(pts):
         xi, yi = int(px), int(py)
-        cnt = cv2.countNonZero(dm[max(0, yi - 3):yi + 4, max(0, xi - 3):xi + 4])
+        cnt = cv2.countNonZero(dm[max(0, yi - 3):yi + 4, max(0, xi - 3):xi + 4]) if vis[i] else 0
         if cnt >= 4:
             run.append((cnt, i))
         if (cnt < 4 or i == len(pts) - 1) and run:
@@ -782,6 +814,18 @@ def make_plan(img, src, goal, stations, known_cols=()):
     p.route = [(int(round(x)), int(round(y))) for x, y in route]
     p.idx = idx
     return p
+
+
+def ready_legs(plan, view, goal_ok):
+    """Сколько перегонов плана можно протянуть прямо сейчас, не двигая карту.
+    -> (число перегонов, точка, которую надо открыть сдвигом карты, или None)."""
+    for i in range(len(plan.route) - 1):
+        b = plan.route[i + 1]
+        seg = plan.path[plan.idx[i]:plan.idx[i + 1] + 1]
+        bad = [q for q in seg if view.blocked(q, 2)]
+        if bad or view.blocked(b, 16) or (i == len(plan.route) - 2 and not goal_ok):
+            return i, (tuple(bad[0]) if bad else b)
+    return len(plan.route) - 1, None
 
 
 def draw_plan(img, p, legs=0, rects=()):
@@ -1375,7 +1419,7 @@ class Bot:
             plan, legs, trouble = None, 0, None
             src_ok = v.clear(src) and (v.cur is not None or v.G is not None)
             if src_ok:
-                plan = make_plan(v.img, src, dst, v.stations, cols_seen)
+                plan = make_plan(v.img, src, dst, v.stations, cols_seen, v.rects)
                 if not plan.error:
                     cols_seen = plan.cols
                 elif v.R is not None and v.clear(v.R):
@@ -1389,15 +1433,7 @@ class Bot:
                 else:
                     plan = None      # цель спрятана под интерфейсом - сначала сдвинем карту
             if plan:
-                goal_ok = v.R is not None and v.clear(v.R)
-                for i in range(len(plan.route) - 1):
-                    b = plan.route[i + 1]
-                    seg = plan.path[plan.idx[i]:plan.idx[i + 1] + 1]
-                    bad = [q for q in seg if v.blocked(q, 2)]
-                    if bad or v.blocked(b, 16) or (i == len(plan.route) - 2 and not goal_ok):
-                        trouble = tuple(bad[0]) if bad else b
-                        break
-                    legs += 1
+                legs, trouble = ready_legs(plan, v, v.R is not None and v.clear(v.R))
                 self.dbg("plan", draw_plan(v.img, plan, legs, v.rects))
                 if not announced:
                     log(f"Маршрут: {len(plan.route) - 1} перегон(ов)")
@@ -1413,13 +1449,19 @@ class Bot:
                     ty = min(sy1 - m, max(sy0 + m, cy - (dst[1] - src[1]) / 2))
                     vec = (tx - src[0], ty - src[1])
                 else:
-                    q = trouble or dst
-                    # оба конца в свободной зоне? иначе показываем проблемное место
-                    if abs(dst[0] - src[0]) <= sx1 - sx0 - 2 * m and abs(dst[1] - src[1]) <= sy1 - sy0 - 2 * m:
-                        q = dst
-                    tx = min(sx1 - m, max(sx0 + m, cx - (q[0] - src[0]) / 2))
-                    ty = min(sy1 - m, max(sy0 + m, cy - (q[1] - src[1]) / 2))
-                    vec = (tx - src[0], ty - src[1])
+                    # текущая станция, цель и место, где путь уходит под интерфейс,
+                    # помещаются в свободную зону вместе? Тогда ставим их посередине:
+                    # иначе линия, которая петляет под панелью, так и осталась бы под ней
+                    need = [src, dst] + ([trouble] if trouble else [])
+                    nx0, nx1 = min(p[0] for p in need), max(p[0] for p in need)
+                    ny0, ny1 = min(p[1] for p in need), max(p[1] for p in need)
+                    if nx1 - nx0 <= sx1 - sx0 - 2 * m and ny1 - ny0 <= sy1 - sy0 - 2 * m:
+                        vec = (cx - (nx0 + nx1) / 2, cy - (ny0 + ny1) / 2)
+                    else:      # не помещаются - показываем проблемное место
+                        q = trouble or dst
+                        tx = min(sx1 - m, max(sx0 + m, cx - (q[0] - src[0]) / 2))
+                        ty = min(sy1 - m, max(sy0 + m, cy - (q[1] - src[1]) / 2))
+                        vec = (tx - src[0], ty - src[1])
                 moved = (0, 0)
                 if math.hypot(*vec) >= 20:
                     moved = self.pan(v, vec)
@@ -1539,7 +1581,7 @@ class Bot:
         if st != "task":
             log("Окно задания Guide не открыто - возьми задание и запусти проверку ещё раз")
         elif src and v.R:
-            plan = make_plan(img, src, v.R, v.stations, self.city["line"])
+            plan = make_plan(img, src, v.R, v.stations, self.city["line"], v.rects)
             if plan.error:
                 log(f"Маршрут не построен: {plan.error}")
             else:
