@@ -7,18 +7,23 @@ Guide-бот для Roblox (метро-тайкун): сам берёт зада
 Клавиши:  P - пауза / продолжить
           O - выход
           (срабатывают, когда активно окно игры или окно бота; F8 / F10 работают везде)
+Город:    бот сам узнаёт город по надписи на кнопке «City · Menu» (Самара, Belgian Coast)
+          и сразу начинает работать. --city samara / --city belgian - задать город вручную.
 Опции:    --count N     выполнить N заданий и выйти (по умолчанию без ограничения)
           --once        то же, что --count 1
           --cooldown N  пауза после пройденного задания в секундах (по умолчанию 10)
           --debug       подробный лог и размеченные скриншоты в папку debug/
+          --check       один снимок без мыши: что бот видит и какой маршрут построил бы
 
 Требования: Windows, Python 3.10+, pip install opencv-python mss numpy
-Игра должна быть открыта (окно бот развернёт сам), карта - с одной веткой метро.
+Игра должна быть открыта (окно бот развернёт сам), карта - с одной веткой метро
+(Самара или Belgian Coast).
 Пока бот работает, мышь занята: не двигай её и не переключай окно (или поставь паузу клавишей P).
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import heapq
 import math
@@ -281,6 +286,17 @@ C_PURPLE = (122, 90, 222)     # кнопка Tasks
 C_DOT_IN = (54, 58, 66)       # заливка кружка станции
 
 
+def is_light(img):
+    """Днём (по игровому времени) карта светлая, ночью тёмная - цвета почти все другие.
+    Считаем только серые пиксели суши: море на Belgian Coast, реки и парки цветные
+    и могут занимать пол-экрана, поэтому в подсчёт не попадают."""
+    h, w = img.shape[:2]
+    s = img[int(h * 0.2):int(h * 0.65):16, int(w * 0.05):int(w * 0.8):16].reshape(-1, 3).astype(np.int16)
+    lo, hi = s.min(axis=1), s.max(axis=1)
+    neutral = hi - lo <= 18
+    return int((neutral & (lo >= 200)).sum()) > int((neutral & (hi <= 100)).sum())
+
+
 def cmask(img, rgb, tol):
     lo = np.clip(np.array(rgb) - tol, 0, 255).astype(np.uint8)
     hi = np.clip(np.array(rgb) + tol, 0, 255).astype(np.uint8)
@@ -340,14 +356,16 @@ def find_ring_ex(img, rgb):
     """Кольцо вокруг станции Start/Goal -> (cx, cy, r, доля видимой окружности) или None.
     Работает на любом масштабе и когда часть кольца закрыта интерфейсом."""
     h, w = img.shape[:2]
+    light = is_light(img)
     m = ring_mask(img, rgb)
     thick = cv2.dilate(cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)),
                        np.ones((7, 7), np.uint8))
     thin = cv2.bitwise_and(m, cv2.bitwise_not(thick))
     wide = cv2.dilate(thin, np.ones((3, 3), np.uint8))
-    rmin, rmax = 15.0, w * 0.07
+    rmin, rmax = 15.0, w * 0.16
     rng = np.random.default_rng(1)
     best = None
+    best_score = 0.0
     # склеиваем обрывки кольца в группы и в каждой ищем окружность (RANSAC)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(thin, np.ones((7, 7), np.uint8)), connectivity=8)
     for i in range(1, n):
@@ -387,16 +405,26 @@ def find_ring_ex(img, rgb):
         if not (rmin <= r <= rmax):
             continue
         cov = _coverage(wide, cx, cy, r)
-        # внутри настоящего кольца - тёмная карта, а не заливка (отсекает значки линий и кнопки)
+        # внутри настоящего кольца - карта (тёмная ночью, светлая днём), а не цветная
+        # заливка: это отсекает значки линий и кнопки
         ang = np.linspace(0, 2 * np.pi, 48, endpoint=False)
-        dark = []
+        plain = []
         for q in (r - 4.0, r * 0.7):
             px = np.clip(np.round(cx + q * np.cos(ang)).astype(int), 0, w - 1)
             py = np.clip(np.round(cy + q * np.sin(ang)).astype(int), 0, h - 1)
-            dark.append((img[py, px].max(1) < 140).mean())
-        if min(dark) < 0.6:
+            inside = img[py, px]
+            plain.append((inside.min(1) >= 170).mean() if light else (inside.max(1) < 140).mean())
+        if min(plain) < 0.6:
             continue
-        if cov >= 0.22 and (best is None or cov > best[3]):
+        # У Start/Goal над кольцом есть толстая цветная метка. Она помогает
+        # отличить станцию от круглого аватара Discord поверх карты. Если метка
+        # закрыта интерфейсом, кольцо по-прежнему можно найти по одной окружности.
+        x0, x1 = max(0, int(cx - 0.7 * r)), min(w, int(cx + 0.7 * r) + 1)
+        y0, y1 = max(0, int(cy - 2.3 * r)), max(0, int(cy - 0.35 * r))
+        pin = cv2.countNonZero(thick[y0:y1, x0:x1]) >= 0.15 * r * r
+        score = cov * (1.4 if pin and cov >= 0.5 else 1.0)
+        if cov >= 0.22 and score > best_score:
+            best_score = score
             best = (float(cx), float(cy), float(r), float(cov))
     return best
 
@@ -407,8 +435,88 @@ def dot_mask(img):
     return cv2.inRange(img, np.array((50, 54, 61), np.uint8), np.array((70, 72, 82), np.uint8))
 
 
-def find_stations(img):
-    """Кружки станций: тёмная заливка + серый ободок. -> список (x, y, r)."""
+def find_stations(img, refs=()):
+    """Обычные серые и прокачанные золотые станции. -> список (x, y, r).
+    refs - точки, где станция есть наверняка (см. find_light_stations)."""
+    out = find_light_stations(img, refs=refs) if is_light(img) else find_dark_stations(img)
+    for s in find_gold_stations(img):
+        if all(math.hypot(s[0] - x, s[1] - y) > max(s[2], r) for x, y, r in out):
+            out.append(s)
+    return out
+
+
+def find_light_stations(img, loose=False, refs=()):
+    """Станции днём: белый кружок с серым ободком. Ищем белую середину, отделённую
+    ободком от белого же фона - так кружок находится, даже когда на станции стоит поезд.
+
+    loose - мягкие правила для поиска вдоль уже найденной линии (там ошибиться труднее).
+    refs  - точки, где станция есть наверняка (центры колец Start/Goal): все станции на
+            кадре одного размера, поэтому по ним отсеиваются буквы надписей и окна поездов.
+    """
+    h, w = img.shape[:2]
+    lo = img.min(axis=2)
+    hi = img.max(axis=2)
+    n, _, stats, _ = cv2.connectedComponentsWithStats((lo >= 225).astype(np.uint8), connectivity=4)
+    bx, by, bw, bh, area = (stats[:, k] for k in range(5))
+    small = np.maximum(bw, bh) <= 6
+    ok = ((bw >= 2) & (bh >= 2) & (bw <= 18) & (bh <= 18) & (np.abs(bw - bh) <= 2)
+          & (area >= np.where(small, 0.45, 0.55) * bw * bh))
+    cand = []
+    ang = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+    ang24 = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+    for i in np.nonzero(ok)[0]:
+        if i == 0:
+            continue
+        cx, cy = bx[i] + (bw[i] - 1) / 2.0, by[i] + (bh[i] - 1) / 2.0
+        rr = (bw[i] + bh[i]) / 4.0 + 0.5
+        closed = np.zeros(16, bool)     # вокруг середины нет разрывов
+        grayish = np.zeros(16, bool)    # и это именно серый ободок, а не буква или значок
+        dark = 0
+        for q in (rr, rr + 0.8):
+            xs = np.clip(np.round(cx + q * np.cos(ang)).astype(int), 0, w - 1)
+            ys = np.clip(np.round(cy + q * np.sin(ang)).astype(int), 0, h - 1)
+            l, u = lo[ys, xs].astype(int), hi[ys, xs].astype(int)
+            closed |= l < 225
+            grayish |= (u >= 115) & (l <= 212) & (u - l <= 30)
+            if q == rr:
+                dark = int((u < 115).sum())
+        # белая середина уже отделена от фона (иначе слилась бы с ним), поэтому по окружности
+        # достаточно большинства точек: у маленького кружка ободок ромбом и углы выпадают
+        tiny = max(bw[i], bh[i]) <= 5
+        if closed.sum() < (9 if loose else 10):
+            continue
+        # На самом мелком масштабе кружок поверх поезда - это 2-4 белых пикселя, а ободок
+        # сливается с поездом. Вдоль уже найденной линии такому кружку верим и без ободка.
+        if grayish.sum() < (6 if loose else 8) and not (loose and tiny):
+            continue
+        if dark > (8 if loose and tiny else 6):   # тёмная обводка кругом - буква или окно поезда
+            continue
+        on_line = True
+        if not loose:
+            # станция стоит на линии: рядом с ободком есть цветные (не серые) пиксели
+            xs = np.clip(np.round(cx + (rr + 3.0) * np.cos(ang24)).astype(int), 0, w - 1)
+            ys = np.clip(np.round(cy + (rr + 3.0) * np.sin(ang24)).astype(int), 0, h - 1)
+            on_line = ((hi[ys, xs].astype(int) - lo[ys, xs]) >= 14).sum() >= 2
+        if on_line:
+            cand.append((float(cx), float(cy), float(rr + 0.5), (bw[i] + bh[i]) / 2.0))
+    # эталонный размер: станция под кольцом Start/Goal, иначе самый частый размер на кадре
+    size = None
+    known = [c[3] for c in cand if any(math.hypot(c[0] - r[0], c[1] - r[1]) <= 7 for r in refs)]
+    if known:
+        size = sum(known) / len(known)
+    elif len(cand) >= 3:
+        vals, counts = np.unique(np.round([c[3] for c in cand]), return_counts=True)
+        if counts.max() >= 3:
+            size = float(vals[counts.argmax()])
+    if size is not None:
+        # крупнее эталона станция быть не может; мельче - может, если её частично закрыл поезд
+        under = 2.6 if loose and size <= 5.5 else 1.6
+        cand = [c for c in cand if -under <= c[3] - size <= 1.6]
+    return [c[:3] for c in cand]
+
+
+def find_dark_stations(img):
+    """Станции ночью: тёмная заливка + светлый ободок."""
     m = dot_mask(img)
     h, w = m.shape
     out = []
@@ -436,9 +544,49 @@ def find_stations(img):
     return out
 
 
+def find_gold_stations(img):
+    """Прокачанные станции: золотая заливка с цифрой и контрастный круглый ободок.
+
+    Жёлтые значки достопримечательностей полые, поэтому одной проверки цвета
+    недостаточно: проверяем заполненность кружка и ободок (днём тёмный, ночью светлый).
+    """
+    h, w = img.shape[:2]
+    light = is_light(img)
+    red, green, blue = img.astype(np.int16).transpose(2, 0, 1)
+    gold = ((red >= 175) & (green >= 100) & (green <= 210) & (blue <= 110)
+            & (red - green >= 35) & (green - blue >= 45)).astype(np.uint8) * 255
+    # Заполняем отверстия от цифр внутри каждого контура. Замыкание маски всего
+    # кадра склеивало маленькие станции с близкими золотыми подписями над ними.
+    contours, _ = cv2.findContours(gold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(gold, contours, -1, 255, cv2.FILLED)
+    ang = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+    out = []
+    for b in blobs(gold, 10):
+        if not (5 <= b["w"] <= 32 and 5 <= b["h"] <= 32 and abs(b["w"] - b["h"]) <= 2):
+            continue
+        if b["area"] < 0.6 * b["w"] * b["h"]:
+            continue
+        cx, cy = b["x"] + (b["w"] - 1) / 2, b["y"] + (b["h"] - 1) / 2
+        rr = (b["w"] + b["h"]) / 4 + 0.5
+        rim = np.zeros(32, bool)
+        for q in (rr, rr + 1.0):
+            xs = np.clip(np.round(cx + q * np.cos(ang)).astype(int), 0, w - 1)
+            ys = np.clip(np.round(cy + q * np.sin(ang)).astype(int), 0, h - 1)
+            px = img[ys, xs].astype(int)
+            neutral = px.max(1) - px.min(1) <= 65
+            # На маленьком масштабе светлый ободок смешивается с тёмным фоном;
+            # порог 175 терял станцию из-за одного пикселя рядом с поездом.
+            rim |= neutral & ((px.max(1) < 100) if light else (px.min(1) >= 140))
+        if rim.sum() >= 20:
+            out.append((cx, cy, rr + 0.5))
+    return out
+
+
 def line_colors(img, stations):
     """Цвета линии метро: то, что примыкает снаружи к кружкам станций."""
     h, w = img.shape[:2]
+    light = is_light(img)
+    gray = 14 if light else 22      # днём линия бледная, почти серая
     ang = np.linspace(0, 2 * np.pi, 24, endpoint=False)
     seen = {}
     for cx, cy, r in stations:
@@ -447,7 +595,7 @@ def line_colors(img, stations):
         px = img[ys, xs].astype(int)
         cnt = {}
         for p in px:
-            if np.abs(p - C_BG).max() <= 8 or p.max() - p.min() < 22:
+            if p.max() - p.min() < gray or (not light and np.abs(p - C_BG).max() <= 8):
                 continue  # фон и серое/белое (текст, поезда)
             k = tuple(int(v) // 6 for v in p)
             cnt[k] = cnt.get(k, 0) + 1
@@ -468,6 +616,23 @@ def line_mask(img, colors):
     for c in colors:
         m |= cmask(img, c, 9)
     return m
+
+
+def round_blob(mask, cx, cy):
+    """Пятно маски возле (cx, cy) круглое, как заливка кружка станции, а не тонкая полоска.
+    Тёмное нутро вагона (Belgian Coast) по цвету почти как кружок станции, но вытянуто
+    вдоль линии - без этой проверки бот тянул маршрут на поезд."""
+    x0, y0 = max(0, int(cx) - 8), max(0, int(cy) - 8)
+    sub = mask[y0:int(cy) + 9, x0:int(cx) + 9]
+    n, lab, _, cent = cv2.connectedComponentsWithStats(sub, connectivity=8)
+    if n < 2:
+        return False
+    i = min(range(1, n), key=lambda k: math.hypot(cent[k][0] + x0 - cx, cent[k][1] + y0 - cy))
+    ys, xs = np.nonzero(lab == i)
+    if len(xs) < 3:
+        return False
+    lo, hi = np.linalg.eigvalsh(np.cov(np.vstack([xs, ys]).astype(float)))
+    return lo > 1e-6 and hi <= 6.25 * lo      # вытянутость (отношение осей) не больше 2.5
 
 
 def shortest_path(cost, src, dst):
@@ -515,11 +680,14 @@ class Plan:
         self.idx = []         # индекс точки пути для каждой станции маршрута
         self.path = []        # точки пути вдоль линии
         self.stations = []
+        self.cols = []        # цвета линии, найденные на этом кадре
         self.error = None
 
 
-def make_plan(img, src, goal, stations):
-    """Маршрут вдоль линии метро от src до goal через найденные кружки станций."""
+def make_plan(img, src, goal, stations, known_cols=()):
+    """Маршрут вдоль линии метро от src до goal через найденные кружки станций.
+    known_cols - цвета линии с прошлых кадров этого задания: когда большая часть маршрута
+    уже пройдена, на кадре остаётся мало станций и определить цвет заново не всегда удаётся."""
     p = Plan()
     p.stations = stations
     h, w = img.shape[:2]
@@ -532,10 +700,11 @@ def make_plan(img, src, goal, stations):
         return (s[0], s[1]) if dm <= 9 else pt
 
     a, b = snap(src), snap(goal)
-    cols = line_colors(img, stations)
+    cols = list(dict.fromkeys(list(line_colors(img, stations)) + list(known_cols)))
     if not cols:
         p.error = "не определил цвет линии"
         return p
+    p.cols = cols
     lm = cv2.dilate(line_mask(img, cols), np.ones((3, 3), np.uint8))
     f = 3
     xs = [s[0] for s in stations] + [a[0], b[0]]
@@ -565,7 +734,22 @@ def make_plan(img, src, goal, stations):
             on.append((i, cx, cy))
     # Страховка: станции должны идти строго по одной, пропускать нельзя. Поэтому ещё раз
     # проходим вдоль самой линии и ищем кружки, которые общий поиск мог не узнать.
-    dm = dot_mask(img)
+    if is_light(img):
+        for cx, cy, _ in find_light_stations(img, loose=True, refs=(a, b)):
+            d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+            i = int(d.argmin())
+            if d[i] <= 5 and all(math.hypot(cx - o[1], cy - o[2]) > 10 for o in on):
+                on.append((i, cx, cy))
+        dm = np.zeros(img.shape[:2], np.uint8)
+    else:
+        gold = find_gold_stations(img)
+        # Если на найденном участке есть только золотые станции, серые детали
+        # вагонов не должны добавлять новые остановки резервным поиском.
+        def is_gold(cx, cy):
+            return any(math.hypot(cx - x, cy - y) <= 2 for x, y, _ in gold)
+
+        all_gold = len(on) >= 2 and all(is_gold(cx, cy) for _, cx, cy in on)
+        dm = np.zeros(img.shape[:2], np.uint8) if all_gold else dot_mask(img)
     run = []
     for i, (px, py) in enumerate(pts):
         xi, yi = int(px), int(py)
@@ -580,7 +764,8 @@ def make_plan(img, src, goal, stations):
             cx, cy = xs_.mean() + max(0, xi - 6), ys_.mean() + max(0, yi - 6)
             near = img[max(0, yi - 9):yi + 10, max(0, xi - 9):xi + 10].astype(int)
             yellow = ((near[:, :, 0] > 200) & (near[:, :, 1] > 140) & (near[:, :, 2] < 110)).sum()
-            if yellow <= 6 and all(math.hypot(cx - o[1], cy - o[2]) > 10 for o in on):
+            if (yellow <= 6 and all(math.hypot(cx - o[1], cy - o[2]) > 10 for o in on)
+                    and round_blob(dm, cx, cy)):
                 on.append((bi, float(cx), float(cy)))
     on.sort()
     route, idx = [tuple(a)], [0]
@@ -661,31 +846,152 @@ def is_blocked(pt, rects, w, h, m=16):
     return any(x0 - m <= x <= x1 + m and y0 - m <= y <= y1 + m for x0, y0, x1, y1 in rects)
 
 
-def has_blue_pin(img, st, scale):
-    """Синяя метка Current над станцией st?"""
+def blue_pins(img, scale):
+    """Синие метки Current на кадре -> [(x центра, y нижнего края)].
+    Метки (как и булавки Start/Goal) всегда около 41x46 px, при любом размере окна."""
+    out = []
+    for b in blobs(cmask(img, C_BLUE, 14), 250):
+        if 24 <= b["w"] <= 54 and 28 <= b["h"] <= 66:
+            out.append((b["x"] + b["w"] / 2.0, float(b["y"] + b["h"])))
+    return out
+
+
+PIN_TIP_TO_STATION = 17    # от острия булавки Start/Goal до центра станции, px (булавка качается на +-4)
+
+
+def find_pin(img, rgb):
+    """Булавка Start / Goal -> примерный центр станции под ней (x, y) или None.
+
+    На мелком масштабе кольцо вокруг станции почти не видно (Belgian Coast на минимальном
+    масштабе), а булавка с табличкой «Start» / «Goal» всегда одного размера и висит
+    ровно над станцией. Высота качается на несколько пикселей - точное место потом
+    уточняется по кружку станции."""
     h, w = img.shape[:2]
-    x, y = st
-    x0, x1 = int(max(0, x - 34 * scale)), int(min(w, x + 34 * scale))
-    y0, y1 = int(max(0, y - 100 * scale)), int(max(0, y - 8 * scale))
-    if y1 <= y0 or x1 <= x0:
+    light = is_light(img)
+    best = None
+    for b in blobs(cmask(img, rgb, 16), 300):
+        if not (30 <= b["w"] <= 54 and 34 <= b["h"] <= 60):
+            continue
+        cx = b["x"] + (b["w"] - 1) / 2.0
+        # над булавкой - белая табличка с надписью (ночью её видно на тёмной карте;
+        # днём карта сама белая, и проверка ничего не даёт)
+        x0, x1 = int(max(0, cx - 45)), int(min(w, cx + 46))
+        y0, y1 = int(max(0, b["y"] - 34)), int(max(0, b["y"] - 2))
+        label = int((img[y0:y1, x0:x1].min(axis=2) >= 235).sum()) if y1 > y0 else 0
+        if not light and label < 300:
+            continue
+        if best is None or label > best[0]:
+            best = (label, (float(cx), float(b["y"] + b["h"] + PIN_TIP_TO_STATION)))
+    return best and best[1]
+
+
+def find_marker(img, rgb):
+    """Станция Start / Goal -> ((x, y), точно) или (None, False).
+    Точно - по кольцу вокруг станции; не точно - по булавке над ней."""
+    r = find_ring_ex(img, rgb)
+    if r and r[3] >= (0.5 if r[2] >= 15 else 0.62):
+        return (r[0], r[1]), True
+    p = find_pin(img, rgb)
+    return (p, False) if p else (None, False)
+
+
+def same_marker(a, b):
+    """Метка не сдвинулась (камера стоит). Булавка качается вверх-вниз, кольцо - нет."""
+    (pa, ea), (pb, eb) = a, b
+    if (pa is None) != (pb is None):
         return False
-    return cv2.countNonZero(cmask(img[y0:y1, x0:x1], C_BLUE, 14)) >= 60 * scale * scale
+    if pa is None:
+        return True
+    tol_y = 1.5 if ea and eb else 7.0
+    return abs(pa[0] - pb[0]) < 1.5 and abs(pa[1] - pb[1]) < tol_y
+
+
+def marker_moved(before, after):
+    """Камера поехала: метка Goal заметно сдвинулась или пропала. Качание булавки - не сдвиг."""
+    (pa, ea), (pb, eb) = before, after
+    if pa is None:
+        return False
+    if pb is None:
+        return True
+    return abs(pa[0] - pb[0]) > 3 or abs(pa[1] - pb[1]) > (3 if ea and eb else 9)
+
+
+def has_blue_pin(img, st, scale):
+    """Синяя метка Current стоит ровно над станцией st? (метка слегка покачивается)"""
+    x, y = st
+    return any(abs(px - x) <= 12 * scale and 4 * scale <= y - py <= 36 * scale
+               for px, py in blue_pins(img, scale))
+
+
+def train_near(img, pt, scale):
+    """Стоит ли на станции поезд. Пока он там, игра не принимает протяжку к этой станции."""
+    h, w = img.shape[:2]
+    r = int(round(11 * scale))
+    x, y = int(round(pt[0])), int(round(pt[1]))
+    x0, y0 = max(0, x - r), max(0, y - r)
+    crop = img[y0:y + r + 1, x0:x + r + 1]
+    if crop.size == 0:
+        return False
+    if is_light(img):       # днём поезд тёмный
+        train = crop.max(axis=2) < 95
+    else:                   # ночью - светлый
+        train = crop.min(axis=2) >= 215
+    ys, xs = np.ogrid[y0:y0 + crop.shape[0], x0:x0 + crop.shape[1]]
+    # В углах квадратного окна уже лежат подписи станций, а не ближайшие вагоны.
+    train &= (xs - pt[0]) ** 2 + (ys - pt[1]) ** 2 <= (r + 0.5) ** 2
+    # Ободок и цифра прокачанной станции имеют тот же цвет, что и поезд.
+    # Убираем только сам распознанный значок: вагоны рядом остаются видимыми.
+    for cx, cy, radius in find_gold_stations(img):
+        if math.hypot(cx - pt[0], cy - pt[1]) <= 3 * scale:
+            train &= (xs - cx) ** 2 + (ys - cy) ** 2 > (radius + 1) ** 2
+    n = int(train.sum())
+    return n >= 10 * scale * scale
+
+
+def light_dot_near(img, pt, rad=9):
+    """Днём: белая середина кружка станции рядом с точкой pt, без проверки ободка.
+    Нужна для станции под меткой Current: она стоит на стыке красного и бледного участков
+    линии, и её ободок на обычный серый не похож."""
+    h, w = img.shape[:2]
+    m = int(rad + 12)
+    x0, x1 = max(0, int(pt[0]) - m), min(w, int(pt[0]) + m + 1)
+    y0, y1 = max(0, int(pt[1]) - m), min(h, int(pt[1]) + m + 1)
+    crop = (img[y0:y1, x0:x1].min(axis=2) >= 225).astype(np.uint8)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(crop, connectivity=4)
+    best = None
+    for i in range(1, n):
+        bx, by, bw, bh, area = stats[i]
+        if bx == 0 or by == 0 or bx + bw >= crop.shape[1] or by + bh >= crop.shape[0]:
+            continue        # касается края окна - это фон карты, а не кружок
+        if not (2 <= bw <= 18 and 2 <= bh <= 18 and abs(bw - bh) <= 3 and area >= 0.45 * bw * bh):
+            continue
+        cx, cy = x0 + bx + (bw - 1) / 2.0, y0 + by + (bh - 1) / 2.0
+        d = math.hypot(cx - pt[0], cy - pt[1])
+        if d <= rad and (best is None or d < best[0]):
+            best = (d, (cx, cy))
+    return best and best[1]
 
 
 def find_current(img, stations, rects, scale):
-    """Станция под синей меткой Current (докуда уже построен маршрут)."""
+    """Станция под синей меткой Current (докуда уже построен маршрут).
+    Если сам кружок не распознан (стоит поезд), берём точку под остриём метки."""
     h, w = img.shape[:2]
     best = None
-    for b in blobs(cmask(img, C_BLUE, 14), int(250 * scale * scale)):
-        if not (24 * scale <= b["w"] <= 54 * scale and 28 * scale <= b["h"] <= 66 * scale):
+    for px, py in blue_pins(img, scale):
+        if is_blocked((px, py - 20 * scale), rects, w, h, 0):
             continue
-        if is_blocked((b["cx"], b["cy"]), rects, w, h, 0):
-            continue
-        tx, ty = b["x"] + b["w"] / 2.0, b["y"] + b["h"] + 18 * scale
+        tx, ty = px, py + 18 * scale
+        cand = (99.0, (tx, ty))
         for cx, cy, _ in stations:
             d = math.hypot(cx - tx, cy - ty)
-            if abs(cx - tx) <= 10 * scale and d <= 22 * scale and (best is None or d < best[0]):
-                best = (d, (cx, cy))
+            if abs(cx - tx) <= 10 * scale and d <= 22 * scale and d < cand[0]:
+                cand = (d, (cx, cy))
+        if cand[0] == 99.0 and is_light(img):
+            dot = light_dot_near(img, (tx, ty), 9 * scale)
+            if dot:
+                cand = (50.0, dot)
+        if best is None or cand[0] < best[0]:
+            best = cand
     return best and best[1]
 
 
@@ -693,11 +999,94 @@ def find_current(img, stations, rects, scale):
 #  Логика бота
 # --------------------------------------------------------------------------- #
 T0 = time.time()
-ZOOM_STEP = 0.98      # один щелчок колеса мыши
+ZOOM_STEP = 0.85      # один щелчок колеса мыши (замерено: 10 щелчков - в 5.3 раза)
+
+# Города, на которых бот проверен. Город бот узнаёт сам по надписи на кнопке
+# «City · Menu» внизу слева. label - эта надпись (PNG в base64, вырезана из кадра
+# высотой 1009 px). line - цвет линии метро: бот находит его на каждом кадре сам,
+# а этот нужен, когда на экране слишком мало станций, чтобы его определить.
+CITIES = {
+    "samara": {"name": "Самара", "line": [(213, 39, 45), (75, 39, 45)], "label": (
+        "iVBORw0KGgoAAAANSUhEUgAAAFwAAAAVCAAAAADu09YgAAACl0lEQVQ4y2O0Y6AdYAGTjDKSol9f3/xDC8PNYuVB"
+        "1M+dy75R1XBmoLGupQIQi9SdXj2mpuFMDAwS6XCewF9qB4seGwPDk6WPJHU8OBachIjySnO+fAm2iI0dGFy/WFTZ"
+        "boNCTEnwyav/DNjVMKuz3viJKgE0XBlIHTjK8PjUFtsNICHZQHNeIPVx7dbfDAxeSQwMM0+3iTF8bb8kVqXEwHCv"
+        "5wlWNUfaZRhKbqFKAMNcR5OBQfL+KwaGr9dBZkeXKrODaA5DsRMMDBqGDAz3g+WAztM/0KAIFBY02fYfm5ogoBt3"
+        "vUWVABrOZcPAwO3sKsv0HOxjJicg8Y8RSCg+eALWqC0MEufyAVMMPM8eYFMjygAyHFUCGCzHrwOdziDi5vZh3Uag"
+        "8RdvsW268ZwtIhCo4zjYuP+bz5j4Ad3+evW7MDUGBgVsahgeH3kg9QFNAmj4/4YcW0haSVLpAVJNn4DE98V+zODY"
+        "AIIN8xkuOAJDsu4pw/9aBgZhbGruVkOyCIoEKBN9717hai4JkrI7DEwuLLF6wnzAAGNg4IRoBEYHwxdeMP0Fknox"
+        "1eyBZj8UCUj2fzxvnqR1IFC/1UkGpQ4OggkYpxpUCZDhzEzAZPN8zetiYIZiYCgBSn978JdBmwm34TjVoEqADM9S"
+        "6nrOAPHgMwZeGQaGOyX/GDiX4DYcpxo0CaDhYa4MEw/e/KXoDeTeZuAGkr//MXDVsuJ2OE41aBIsDGoxwDTv7g7m"
+        "Pd3P8PIrN4PmjDdaLHiCHKcaNAkmhluzfsHkPnd+Z/i/DMiQ0mPZi6dwx6kGTQJox5ajfubAsGL4tGcVKD1tYYrm"
+        "YPi8ZLs1HrfjVIMqwQip5viEWJ9/gRfD0n+eEyyqcalBlmCkZR0KAIjBDdYSfSRhAAAAAElFTkSuQmCC")},
+    "belgian": {"name": "Belgian Coast", "line": [(213, 39, 39), (75, 39, 39)], "label": (
+        "iVBORw0KGgoAAAANSUhEUgAAAHMAAAATCAAAAACG3G1gAAAD00lEQVRIx8VWbVBUVRh+7mX37l0XXFjWBdb4Wvlw"
+        "JJUhR2o2JEsl22ymcRgZ0ilNwmxygsloynKacbQa0/Jrcsom0SwZkmnwAwbURJtGqdXFAI1dNg0hPgxlcYG7e7md"
+        "e9ldbjDs8IOp8+Pc95z3Oec5H8973kstwn9eFJPExVLunink3KghX3dnXZe8/xPm2iF5ezfz00dBpnloUfyMu9Ya"
+        "72Q5MyMkK/8Dm3xfbNvkF06tylUCSZlP7bgbFPfk69ja4DtbzkkZQxV5tiDwN6kHEzufzicHdS+aTlnzafDFhYDy"
+        "32fHZrClbCixZucneR2lTj/khSdUl0+8h4oqFKusBzHzudlG7uYxO7BHZa1Zl3L7c7sI074Efn8tNJtCDwBpeSah"
+        "9dtmyMCGF+eGdjWfbtmSChQNVVVInEwiZqlwBTBvpoFH5r9zY4RzQw6wJC0G5MKj2XAwO4mhWjCnuJ00M8zhSHm3"
+        "kCOwOWpU1wIPPlRyWPwG2Un6vN0XZOD34wCjsaNFrwV0CBvZZ8xnpKo6CraQtu9SlxjWlkiUUUvhquBXBE6Gq068"
+        "0Jm+alrWcXHMJYdFH5ncSMx44KroFzho1lOD5VipLqh3B8CGOFSXxmZV4NCjK3DM2S6LlYW/1SWHw/EwOgypCkmA"
+        "Jho/lMM2ekeHo+KN3YNsnGg3fIyhV6AXzWnAoA+RHIbKMqhypyfbAuB+ryKbbfreg+szgGab7z7bSqDfmFrsnAnk"
+        "iG066o74IXpuBYZG5fnaUkpyi5ULaPf13wISfPqLAcjOG3NhbAiA3QfXqbOzC7448683gXfB9WsqnUCUfu4PsaNP"
+        "8pFHYMEvyAxwzl+Gq9bhvLCxaiQyeb6uF3g8opIMmWWFCeiWgat/XpKWoVhbJRBb6ecMsyByGfBXN8eYTjr15tMj"
+        "R9U8oH4mVmMKzB0NfPN7lmZcBNw6v1i39+L9pIXwXOYYyx1YwLU8Ngp+9eapE9vmhdD8APCsx9MkceoKxdpmFw4X"
+        "JOwSKNDl0lyuIwXUXFxL98/dAmzvi6TGh92XiQnTLaLIPL1lq3VvE+u7+6Ng8/LlmwY0sPKwexUZGfVNtG/Y0J/H"
+        "dwio3H57mELr377Ok1tP1e48Kt2dWBxfexnllq7xnK6iIx3DEBrfOouyfWRwz55yGfjKV52Uhv+RxEb3/n4SUqDG"
+        "5hVG1xtQTY6mxqV/2Ywih9+p7REmeGJUEfd84tUKfWPBrLaHH3llIvvd4zllxbCPhYuIoH6bMKW5LCR+Yp/AmxgV"
+        "+LMHuKnNn1TQnK2Mie5v65vqnE39D/8J/wC/nU/W+KLIxwAAAABJRU5ErkJggg==")},
+}
+CITY_ALIASES = {"samara": "samara", "самара": "samara",
+                "belgian": "belgian", "belgium": "belgian", "coast": "belgian",
+                "belgian coast": "belgian", "бельгия": "belgian"}
+UNKNOWN_CITY = {"name": "неизвестный город", "line": []}
+_labels = {}
+
+
+def city_label(key):
+    if key not in _labels:
+        data = np.frombuffer(base64.b64decode(CITIES[key]["label"]), np.uint8)
+        _labels[key] = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+    return _labels[key]
+
+
+def detect_city(img):
+    """Город по надписи на кнопке «City · Menu» внизу слева -> ключ CITIES или None.
+    Интерфейс игры меняет размер вместе с окном (1366x768 - 0.79, 2560x1369 - 1.08),
+    поэтому надпись ищем в нескольких масштабах."""
+    h, w = img.shape[:2]
+    area = img[int(h * 0.6):int(h * 0.96), 0:int(min(w * 0.25, 480))]
+    if area.shape[0] < 30 or area.shape[1] < 60:
+        return None
+    gray = cv2.cvtColor(area, cv2.COLOR_RGB2GRAY)
+    best, key = 0.0, None
+    for k in CITIES:
+        for f in np.arange(0.6, 1.62, 0.04):
+            t = cv2.resize(city_label(k), None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+            if t.shape[0] >= gray.shape[0] or t.shape[1] >= gray.shape[1]:
+                continue
+            r = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
+            score = max(float(r.max()), -float(r.min()))   # ночью надпись светлая, днём тёмная
+            if score > best:
+                best, key = score, k
+    return key if best >= 0.75 else None
+
+
+def app_dir():
+    base = sys.executable if getattr(sys, "frozen", False) else __file__
+    return os.path.dirname(os.path.abspath(base))
 
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def save_png(path, img_bgr):
+    """cv2.imwrite не умеет пути с русскими буквами (например, имя пользователя Windows)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ok, data = cv2.imencode(".png", img_bgr)
+    if ok:
+        data.tofile(path)
 
 
 class View:
@@ -707,19 +1096,35 @@ class View:
         self.img = img
         self.h, self.w = img.shape[:2]
         self.scale = self.w / 1920.0
+        self.hdr = hdr
         self.rects = ui_rects(self.w, self.h, hdr)
         top = (hdr["y"] if hdr else 0.65 * self.h) - 16
         self.safe = (0.03 * self.w, 0.25 * self.h, 0.82 * self.w, top)   # свободная часть карты
-        self.G = self._ring(C_GREEN)
-        self.R = self._ring(C_RED)
-        self.stations = [s for s in find_stations(img) if not self.blocked(s, 6)]
+        # G / R - станции Start / Goal на свободной части карты; G_raw / R_raw - где они
+        # есть вообще, даже под окном задания или панелью: туда можно сдвинуть карту
+        self.G, g_exact, self.G_raw = self._marker(C_GREEN)
+        self.R, r_exact, self.R_raw = self._marker(C_RED)
+        refs = [p for p, ok in ((self.G, g_exact), (self.R, r_exact)) if p and ok]
+        self.stations = [s for s in find_stations(img, refs) if not self.blocked(s, 2)]
+        # станция по булавке известна примерно - уточняем по ближайшему кружку под ней
+        self.G, self.g_exact = self._snap(self.G, g_exact)
+        self.R, self.r_exact = self._snap(self.R, r_exact)
         self.cur = find_current(img, self.stations, self.rects, self.scale)
 
-    def _ring(self, col):
-        r = find_ring_ex(self.img, col)
-        if not r or r[3] < (0.5 if r[2] >= 15 else 0.62):
-            return None
-        return None if self.blocked(r, 0) else (r[0], r[1])
+    def _marker(self, col):
+        p, exact = find_marker(self.img, col)
+        if p is None or self.blocked(p, 0):
+            return None, False, p
+        return p, exact, p
+
+    def _snap(self, p, exact):
+        if p is None or exact:
+            return p, exact
+        near = [s for s in self.stations if abs(s[0] - p[0]) <= 8 and abs(s[1] - p[1]) <= 9]
+        if not near:
+            return p, False
+        s = min(near, key=lambda s: math.hypot(s[0] - p[0], s[1] - p[1]))
+        return (s[0], s[1]), True
 
     def blocked(self, pt, m=16):
         return is_blocked((pt[0], pt[1]), self.rects, self.w, self.h, m)
@@ -735,16 +1140,37 @@ class Bot:
         self.done = 0
         self.failed = 0
         self.next_guide_at = 0.0
-        base = sys.executable if getattr(sys, "frozen", False) else __file__
-        self.dbg_dir = os.path.join(os.path.dirname(os.path.abspath(base)), "debug")
+        self.city_key = args.city          # None - город узнаём сами по надписи в игре
+        self.city_fixed = args.city is not None
+        self.city_checked = 0.0
+        self.city_warned = False
+        self.dbg_dir = os.path.join(app_dir(), "debug")
         self.dbg_n = 0
+
+    @property
+    def city(self):
+        return CITIES.get(self.city_key, UNKNOWN_CITY)
+
+    def update_city(self, img):
+        """Раз в несколько секунд смотрим, какой город открыт в игре (его можно сменить на ходу)."""
+        if self.city_fixed or time.time() - self.city_checked < 3:
+            return
+        self.city_checked = time.time()
+        key = detect_city(img)
+        if key and key != self.city_key:
+            self.city_key = key
+            self.city_warned = False
+            log(f"Город: {CITIES[key]['name']}")
+            ctypes.windll.kernel32.SetConsoleTitleW(f"Guide Bot  |  {CITIES[key]['name']}  |  P - пауза, O - выход")
+        elif key is None and self.city_key is None and not self.city_warned:
+            self.city_warned = True
+            log("Город не узнал - работаю как на любой карте с одной линией")
 
     def dbg(self, name, img_bgr):
         if not self.args.debug:
             return
-        os.makedirs(self.dbg_dir, exist_ok=True)
         self.dbg_n += 1
-        cv2.imwrite(os.path.join(self.dbg_dir, f"{time.strftime('%H%M%S')}_{self.dbg_n:03d}_{name}.png"), img_bgr)
+        save_png(os.path.join(self.dbg_dir, f"{time.strftime('%H%M%S')}_{self.dbg_n:03d}_{name}.png"), img_bgr)
 
     def dbg_rgb(self, name, img):
         if self.args.debug:
@@ -756,18 +1182,16 @@ class Bot:
 
     # ---- ожидание остановки камеры ----
     def wait_still(self, timeout=7.0, need_ring=True):
-        """Ждём, пока карта перестанет двигаться (по кольцам Start/Goal)."""
+        """Ждём, пока карта перестанет двигаться (по станциям Start/Goal: кольцо или булавка)."""
         last, stable, t0 = None, 0, time.time()
         while time.time() - t0 < timeout:
             img = self.g.grab()
             st, hdr = ui_state(img)
             if st != "task":
                 return None
-            g, r = find_ring_ex(img, C_GREEN), find_ring_ex(img, C_RED)
-            cur = tuple((p[0], p[1]) if p and p[3] >= 0.5 else None for p in (g, r))
-            if last is not None and (cur[0] or cur[1] or not need_ring):
-                same = all((a is None) == (b is None) and (a is None or math.hypot(a[0] - b[0], a[1] - b[1]) < 1.5)
-                           for a, b in zip(cur, last))
+            cur = (find_marker(img, C_GREEN), find_marker(img, C_RED))
+            if last is not None and (cur[0][0] or cur[1][0] or not need_ring):
+                same = all(same_marker(a, b) for a, b in zip(cur, last))
                 stable = stable + 1 if same else 0
                 if stable >= 2:
                     return View(img, hdr)
@@ -780,7 +1204,10 @@ class Bot:
         """Сдвинуть карту на vec протяжкой по пустому месту. -> фактический сдвиг."""
         g = self.g
         w, h = v.w, v.h
-        busy = (v.img.max(axis=2) >= 100).astype(np.uint8)        # надписи, значки, кольца, поезда
+        if is_light(v.img):       # днём свободное место - светлое, ночью - тёмное
+            busy = (v.img.min(axis=2) < 200).astype(np.uint8)
+        else:
+            busy = (v.img.max(axis=2) >= 100).astype(np.uint8)    # надписи, значки, кольца, поезда
         cols = line_colors(v.img, v.stations) if v.stations else []
         if cols:
             busy |= (line_mask(v.img, cols) > 0).astype(np.uint8)
@@ -812,22 +1239,41 @@ class Bot:
         return (0, 0)
 
     def zoom_out(self, v, notches):
+        return self.zoom(((v.safe[0] + v.safe[2]) / 2, (v.safe[1] + v.safe[3]) / 2), -notches)
+
+    def zoom(self, at, clicks):
+        """Колесо мыши над точкой at: clicks > 0 - приблизить, < 0 - отдалить.
+        -> (точка, вокруг которой менялся масштаб; во сколько раз изменились расстояния)."""
         g = self.g
-        ax, ay = (v.safe[0] + v.safe[2]) / 2, (v.safe[1] + v.safe[3]) / 2
         g.wait_ready()
-        g.glide(int(ax), int(ay))
+        g.glide(int(at[0]), int(at[1]))
         time.sleep(0.05)
         g._jiggle()
         ax, ay = g.cursor()
-        self.vlog(f"отдаляю карту на {notches} щелчков")
-        for _ in range(notches):
+        self.vlog(f"{'приближаю' if clicks > 0 else 'отдаляю'} карту на {abs(clicks)} щелчков")
+        delta = 120 if clicks > 0 else -120
+        for _ in range(abs(clicks)):
             inp = INPUT(type=0)
-            inp.u.mi = MOUSEINPUT(0, 0, (-120) & 0xFFFFFFFF, 0x0800, 0, 0)
+            inp.u.mi = MOUSEINPUT(0, 0, delta & 0xFFFFFFFF, 0x0800, 0, 0)
             user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
             time.sleep(0.03)
         g.sleep(0.4)
         g.park()
-        return (ax, ay), ZOOM_STEP ** notches
+        return (ax, ay), ZOOM_STEP ** -clicks
+
+    @staticmethod
+    def stations_too_small(v):
+        """Карта отдалена так, что кружков станций не разобрать: кольца Start и Goal
+        на экране (они почти не меняют размер), а станций под ними не видно.
+        Так бывает на Belgian Coast: линия длинная, и на мелком масштабе станции - точки в 2 px."""
+        ends = [(p, ok) for p, ok in ((v.G, v.g_exact), (v.R, v.r_exact)) if p is not None and v.clear(p)]
+
+        def has_station(p, exact):
+            # не точно = нашли только булавку, а кружка станции под ней нет
+            return exact and min((math.hypot(s[0] - p[0], s[1] - p[1]) for s in v.stations),
+                                 default=99.0) <= 8
+
+        return bool(ends) and not any(has_station(p, ok) for p, ok in ends)
 
     def click_dialog(self, hdr, which):
         """Кнопки Start / Goal в окне задания - камера наводится на эту станцию."""
@@ -854,9 +1300,13 @@ class Bot:
             sym = False
         else:
             sym = True      # игра ставит Start и Goal симметрично относительно центра экрана
+        self.dbg_rgb("task", v.img)
+        self.vlog(f"Start {v.G} {'кольцо' if v.g_exact else 'булавка'}, Goal {v.R} "
+                  f"{'кольцо' if v.r_exact else 'булавка'}, станций {len(v.stations)}")
         est = {}            # последние известные координаты: start, goal, cur
         had_undo = False
-        fails = searches = 0
+        cols_seen = list(self.city["line"])   # цвета линии: известный для карты + найденные
+        fails = searches = train_waits = zoom_ins = 0
         announced = False
         for _ in range(40):
             if fails >= 6:
@@ -867,12 +1317,14 @@ class Bot:
                 if st != "task":
                     return True
                 v = View(img, hdr)
-            if v.G:
-                est["start"] = v.G
-            if v.R:
-                est["goal"] = v.R
+            if v.G or v.G_raw:
+                est["start"] = v.G or v.G_raw
+            if v.R or v.R_raw:
+                est["goal"] = v.R or v.R_raw
             if v.cur:
                 est["cur"] = v.cur
+            if v.hdr and self.undo_visible(v.img, v.hdr):
+                had_undo = True          # маршрут уже начат (например, в прошлой попытке)
             if sym:
                 sym = False
                 if "start" in est and "goal" not in est:
@@ -885,24 +1337,51 @@ class Bot:
                 searches += 1
                 if searches > 8:
                     break
-                anchor, z = self.zoom_out(v, 10)
+                anchor, z = self.zoom_out(v, 4)
                 est = {k: (anchor[0] + (p[0] - anchor[0]) * z, anchor[1] + (p[1] - anchor[1]) * z)
                        for k, p in est.items()}
                 v = self.wait_still()
                 continue
 
+            if zoom_ins < 8 and self.stations_too_small(v):
+                zoom_ins += 1
+                sx0, sy0, sx1, sy1 = v.safe
+                room = min((sx1 - sx0) / (abs(dst[0] - src[0]) + 1), (sy1 - sy0) / (abs(dst[1] - src[1]) + 1))
+                mid = ((src[0] + dst[0]) / 2, (src[1] + dst[1]) / 2)
+                # Start и Goal поместятся и после приближения - приближаем вокруг середины,
+                # иначе вокруг текущей станции: дальше бот сам сдвинет карту вдоль маршрута.
+                # Колесо крутим только над картой: над панелью оно листало бы панель.
+                at = next((p for p in (mid if room >= 1.5 else None, src, v.G, v.R)
+                           if p is not None and v.clear(p)), None)
+                if at is not None:
+                    if zoom_ins == 1:
+                        log("Станции слишком мелкие - приближаю карту")
+                    self.dbg_rgb("zoom_in", v.img)
+                    # понемногу (2 щелчка - в 1.4 раза) и каждый раз заново смотрим на карту:
+                    # у масштаба есть предел, и после него пересчёт координат уже неверен
+                    anchor, z = self.zoom(at, 2)
+                    est = {k: (anchor[0] + (p[0] - anchor[0]) * z, anchor[1] + (p[1] - anchor[1]) * z)
+                           for k, p in est.items()}
+                    v = self.wait_still(need_ring=False)
+                    continue
+
             # сколько перегонов можно пройти прямо сейчас, не двигая карту
             plan, legs, trouble = None, 0, None
             src_ok = v.clear(src) and (v.cur is not None or v.G is not None)
             if src_ok:
-                plan = make_plan(v.img, src, dst, v.stations)
-                if plan.error:
-                    # карта видна, но разобрать её не вышло (поезд, анимация) - просто смотрим ещё раз
+                plan = make_plan(v.img, src, dst, v.stations, cols_seen)
+                if not plan.error:
+                    cols_seen = plan.cols
+                elif v.R is not None and v.clear(v.R):
+                    # и старт, и цель видны, но разобрать карту не вышло (поезд, анимация) -
+                    # просто смотрим ещё раз
                     self.vlog(f"план не построен: {plan.error}")
                     fails += 1
                     g.sleep(0.6)
                     v = None
                     continue
+                else:
+                    plan = None      # цель спрятана под интерфейсом - сначала сдвинем карту
             if plan:
                 goal_ok = v.R is not None and v.clear(v.R)
                 for i in range(len(plan.route) - 1):
@@ -940,9 +1419,13 @@ class Bot:
                     moved = self.pan(v, vec)
                 if math.hypot(*moved) < 10:
                     fails += 1
-                    anchor, z = self.zoom_out(v, 12)
-                    est = {k: (anchor[0] + (p[0] - anchor[0]) * z, anchor[1] + (p[1] - anchor[1]) * z)
-                           for k, p in est.items()}
+                    if zoom_ins == 0:
+                        # сдвинуть не вышло - немного отдаляем, чтобы освободить место.
+                        # Если карту уже приближали из-за мелких станций, обратно не отдаляем:
+                        # иначе бот крутил бы колесо туда-сюда без конца
+                        anchor, z = self.zoom_out(v, 3)
+                        est = {k: (anchor[0] + (p[0] - anchor[0]) * z, anchor[1] + (p[1] - anchor[1]) * z)
+                               for k, p in est.items()}
                 else:
                     est = {k: (p[0] + moved[0], p[1] + moved[1]) for k, p in est.items()}
                 v = self.wait_still(need_ring=False)
@@ -950,7 +1433,7 @@ class Bot:
 
             # тянем перегоны
             route = plan.route
-            ring0 = v.R
+            ring0 = find_marker(v.img, C_RED)    # Goal до протяжки: сдвинется, если поедет камера
             ok = True
             for i in range(legs):
                 a, b = route[i], route[i + 1]
@@ -967,17 +1450,29 @@ class Bot:
                         return True
                     ok = False
                 else:
-                    ring1 = find_ring(img, C_RED)
-                    moved = ring0 and ring1 and math.hypot(ring1[0] - ring0[0], ring1[1] - ring0[1]) > 3
-                    if moved or not has_blue_pin(img, b, v.scale):
-                        g.sleep(0.35)             # метка Current могла ещё не доехать
-                        img = g.grab()
-                        if moved or not has_blue_pin(img, b, v.scale):
+                    # метка Current летит к новой станции; на длинном перегоне (Belgian Coast
+                    # на крупном масштабе) это дольше полсекунды - ждём её до 1.2 с
+                    t_end = time.time() + 1.2
+                    while True:
+                        ring1 = find_marker(img, C_RED)
+                        moved = ring1[0] is not None and marker_moved(ring0, ring1)
+                        if not moved and has_blue_pin(img, b, v.scale):
+                            break
+                        if time.time() >= t_end:
                             ok = False
+                            break
+                        g.sleep(0.2)
+                        img = g.grab()
                 if not ok:
-                    self.vlog(f"перегон {i + 1} не засчитан - смотрю заново")
-                    self.dbg_rgb("seg_fail", img)
-                    fails += 1
+                    if train_waits < 40 and (train_near(img, a, v.scale) or train_near(img, b, v.scale)):
+                        # это не ошибка: ждём, пока поезд уедет, и не тратим попытку
+                        train_waits += 1
+                        self.vlog(f"перегон {i + 1}: на станции стоит поезд - жду, пока уедет")
+                        g.sleep(0.8)
+                    else:
+                        self.vlog(f"перегон {i + 1} не засчитан - смотрю заново")
+                        self.dbg_rgb("seg_fail", img)
+                        fails += 1
                     break
                 had_undo = True
                 est["cur"] = b
@@ -1004,13 +1499,50 @@ class Bot:
             st, hdr = ui_state(img)
             if st != "task":
                 return True
-            if had_undo and not self.undo_visible(img, hdr):
-                return True
-            ring = find_ring(img, C_RED)
-            if ring0 and (ring is None or math.hypot(ring[0] - ring0[0], ring[1] - ring0[1]) > 3):
-                return True
+            if had_undo:
+                # начатый маршрут: пока он не закончен, в окне есть кнопка Undo
+                if not self.undo_visible(img, hdr):
+                    return True
+            else:
+                # маршрут из одного перегона: кнопки Undo не бывает, смотрим, поехала ли камера
+                if marker_moved(ring0, find_marker(img, C_RED)):
+                    return True
             self.g.sleep(0.15)
         return False
+
+    def check(self):
+        """Один снимок без движения мыши: что бот видит и какой маршрут построил бы."""
+        self.g.focus()
+        img = self.g.grab()
+        st, hdr = ui_state(img)
+        v = View(img, hdr if st == "task" else None)
+
+        def fmt(p):
+            return f"({p[0]:.0f}, {p[1]:.0f})" if p else "нет"
+
+        if not self.city_fixed:
+            self.city_key = detect_city(img)
+        log(f"Город: {self.city['name']}, экран: {st}, карта {'дневная' if is_light(img) else 'ночная'}, "
+            f"станций: {len(v.stations)}, Start {fmt(v.G)}{'' if v.g_exact else ' (по булавке)'}, "
+            f"Goal {fmt(v.R)}{'' if v.r_exact else ' (по булавке)'}, Current {fmt(v.cur)}")
+        if st == "task" and self.stations_too_small(v):
+            log("Станции слишком мелкие - в работе бот приблизил бы карту")
+        plan = Plan()
+        plan.stations = v.stations
+        src = v.cur or v.G
+        if st != "task":
+            log("Окно задания Guide не открыто - возьми задание и запусти проверку ещё раз")
+        elif src and v.R:
+            plan = make_plan(img, src, v.R, v.stations, self.city["line"])
+            if plan.error:
+                log(f"Маршрут не построен: {plan.error}")
+            else:
+                log(f"Маршрут: {len(plan.route) - 1} перегон(ов): " + " -> ".join(fmt(p) for p in plan.route))
+        else:
+            log("Start или Goal не видно - в работе бот сдвинул бы или отдалил карту")
+        path = os.path.join(self.dbg_dir, f"check_{time.strftime('%H%M%S')}.png")
+        save_png(path, draw_plan(img, plan, 0, v.rects))
+        log(f"Разметка сохранена: {path}")
 
     # ---- главный цикл ----
     def wait_task_end(self, timeout=90):
@@ -1069,6 +1601,7 @@ class Bot:
                 log("Игра снова на экране - продолжаю")
                 self.next_guide_at = 0.0
             self.unknown, self.unknown_at = 0, None
+            self.update_city(img)
 
         if st == "quit":
             if self.quitting:      # сами решили бросить зависшее задание
@@ -1178,6 +1711,9 @@ def main():
     ap.add_argument("--debug", action="store_true", help="подробный лог и размеченные скриншоты в debug/")
     ap.add_argument("--cooldown", type=float, default=10.0, help="пауза после пройденного задания, сек")
     ap.add_argument("--no-maximize", action="store_true", help="не разворачивать окно игры")
+    ap.add_argument("--city", help="город: samara или belgian (без опции бот узнаёт город сам)")
+    ap.add_argument("--check", action="store_true",
+                    help="один снимок без мыши: показать, что бот видит, и сохранить разметку в debug/")
     args = ap.parse_args()
     if args.once:
         args.count = 1
@@ -1187,21 +1723,32 @@ def main():
         except Exception:
             pass
     k32 = ctypes.windll.kernel32
-    k32.SetConsoleTitleW("Guide Bot  |  P - пауза, O - выход")
-    k32.CreateMutexW(None, False, "GuideBot_single_instance")
-    if k32.GetLastError() == 183:      # уже запущен: два бота дрались бы за мышь
-        print("Guide Bot уже запущен в другом окне.")
-        return
+    if not args.check:
+        k32.CreateMutexW(None, False, "GuideBot_single_instance")
+        if k32.GetLastError() == 183:      # уже запущен: два бота дрались бы за мышь
+            print("Guide Bot уже запущен в другом окне.")
+            return
     print(BANNER, flush=True)
+    k32.SetConsoleTitleW("Guide Bot  |  P - пауза, O - выход")
+    if args.city:
+        key = CITY_ALIASES.get(args.city.strip().lower())
+        if not key:
+            print(f"Не знаю город «{args.city}». Есть: samara, belgian. Определю город сам.")
+        args.city = key
+    if args.city:
+        log(f"Город: {CITIES[args.city]['name']} (задан в --city)")
     bot = None
     try:
         bot = Bot(args)
+        if args.check:
+            bot.check()
+            return
         bot.run()
     except (Stop, KeyboardInterrupt):
         pass
     finally:
         _mouse(M_LUP)
-        if bot:
+        if bot and not args.check:
             log(f"Остановлен. Выполнено: {bot.done}, брошено: {bot.failed}, "
                 f"время: {(time.time() - T0) / 60:.1f} мин")
 
