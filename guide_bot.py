@@ -11,7 +11,8 @@ Guide-бот для Roblox (метро-тайкун): сам берёт зада
           и сразу начинает работать. --city samara / --city belgian - задать город вручную.
 Опции:    --count N     выполнить N заданий и выйти (по умолчанию без ограничения)
           --once        то же, что --count 1
-          --cooldown N  пауза после пройденного задания в секундах (по умолчанию 10)
+          --cooldown N  пауза после пройденного задания в секундах
+                        (по умолчанию 10, на Belgian Coast 5)
           --debug       подробный лог и размеченные скриншоты в папку debug/
           --check       один снимок без мыши: что бот видит и какой маршрут построил бы
 
@@ -1005,8 +1006,9 @@ ZOOM_STEP = 0.85      # один щелчок колеса мыши (замер�
 # «City · Menu» внизу слева. label - эта надпись (PNG в base64, вырезана из кадра
 # высотой 1009 px). line - цвет линии метро: бот находит его на каждом кадре сам,
 # а этот нужен, когда на экране слишком мало станций, чтобы его определить.
+# cooldown - пауза после пройденного задания, сек (если не задана опцией --cooldown).
 CITIES = {
-    "samara": {"name": "Самара", "line": [(213, 39, 45), (75, 39, 45)], "label": (
+    "samara": {"name": "Самара", "line": [(213, 39, 45), (75, 39, 45)], "cooldown": 10.0, "label": (
         "iVBORw0KGgoAAAANSUhEUgAAAFwAAAAVCAAAAADu09YgAAACl0lEQVQ4y2O0Y6AdYAGTjDKSol9f3/xDC8PNYuVB"
         "1M+dy75R1XBmoLGupQIQi9SdXj2mpuFMDAwS6XCewF9qB4seGwPDk6WPJHU8OBachIjySnO+fAm2iI0dGFy/WFTZ"
         "boNCTEnwyav/DNjVMKuz3viJKgE0XBlIHTjK8PjUFtsNICHZQHNeIPVx7dbfDAxeSQwMM0+3iTF8bb8kVqXEwHCv"
@@ -1018,7 +1020,7 @@ CITIES = {
         "6nrOAPHgMwZeGQaGOyX/GDiX4DYcpxo0CaDhYa4MEw/e/KXoDeTeZuAGkr//MXDVsuJ2OE41aBIsDGoxwDTv7g7m"
         "Pd3P8PIrN4PmjDdaLHiCHKcaNAkmhluzfsHkPnd+Z/i/DMiQ0mPZi6dwx6kGTQJox5ajfubAsGL4tGcVKD1tYYrm"
         "YPi8ZLs1HrfjVIMqwQip5viEWJ9/gRfD0n+eEyyqcalBlmCkZR0KAIjBDdYSfSRhAAAAAElFTkSuQmCC")},
-    "belgian": {"name": "Belgian Coast", "line": [(213, 39, 39), (75, 39, 39)], "label": (
+    "belgian": {"name": "Belgian Coast", "line": [(213, 39, 39), (75, 39, 39)], "cooldown": 5.0, "label": (
         "iVBORw0KGgoAAAANSUhEUgAAAHMAAAATCAAAAACG3G1gAAAD00lEQVRIx8VWbVBUVRh+7mX37l0XXFjWBdb4Wvlw"
         "JJUhR2o2JEsl22ymcRgZ0ilNwmxygsloynKacbQa0/Jrcsom0SwZkmnwAwbURJtGqdXFAI1dNg0hPgxlcYG7e7md"
         "e9ldbjDs8IOp8+Pc95z3Oec5H8973kstwn9eFJPExVLunink3KghX3dnXZe8/xPm2iF5ezfz00dBpnloUfyMu9Ya"
@@ -1039,7 +1041,7 @@ CITIES = {
 CITY_ALIASES = {"samara": "samara", "самара": "samara",
                 "belgian": "belgian", "belgium": "belgian", "coast": "belgian",
                 "belgian coast": "belgian", "бельгия": "belgian"}
-UNKNOWN_CITY = {"name": "неизвестный город", "line": []}
+UNKNOWN_CITY = {"name": "неизвестный город", "line": [], "cooldown": 10.0}
 _labels = {}
 
 
@@ -1150,6 +1152,10 @@ class Bot:
     @property
     def city(self):
         return CITIES.get(self.city_key, UNKNOWN_CITY)
+
+    def cooldown(self):
+        """Пауза после задания: из --cooldown, иначе своя для города (Belgian Coast - 5 с)."""
+        return self.args.cooldown if self.args.cooldown is not None else self.city["cooldown"]
 
     def update_city(self, img):
         """Раз в несколько секунд смотрим, какой город открыт в игре (его можно сменить на ходу)."""
@@ -1608,7 +1614,7 @@ class Bot:
                 g.click(int(d["cx"]), int(d["cy"]))
                 self.quitting = False
                 self.tries = 0
-                self.next_guide_at = time.time() + self.args.cooldown
+                self.next_guide_at = time.time() + self.cooldown()
             else:                  # окно выхода открылось случайно - "Keep going"
                 g.click(int(d["cx"] - 1.076 * d["w"]), int(d["cy"]))
             g.park()
@@ -1622,7 +1628,7 @@ class Bot:
             if end in ("bar", "closed", "intro"):
                 self.done += 1
                 self.tries = 0
-                self.next_guide_at = time.time() + self.args.cooldown
+                self.next_guide_at = time.time() + self.cooldown()
                 log(f"Готово за {time.time() - t0:.1f} c. Всего выполнено: {self.done}")
                 if self.args.count and self.done >= self.args.count:
                     return True
@@ -1709,7 +1715,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="выполнить одно задание и выйти")
     ap.add_argument("--count", type=int, default=0, help="сколько заданий выполнить (0 = без ограничения)")
     ap.add_argument("--debug", action="store_true", help="подробный лог и размеченные скриншоты в debug/")
-    ap.add_argument("--cooldown", type=float, default=10.0, help="пауза после пройденного задания, сек")
+    ap.add_argument("--cooldown", type=float, default=None,
+                    help="пауза после пройденного задания, сек (по умолчанию 10, на Belgian Coast 5)")
     ap.add_argument("--no-maximize", action="store_true", help="не разворачивать окно игры")
     ap.add_argument("--city", help="город: samara или belgian (без опции бот узнаёт город сам)")
     ap.add_argument("--check", action="store_true",
