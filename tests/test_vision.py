@@ -398,6 +398,46 @@ class BelgianCoastTests(unittest.TestCase):
         self.assertEqual(view.cur, view.route_far)
         self.assertFalse(view.clear(view.cur))
 
+    def test_tiny_station_on_bend_is_found(self):
+        # De Panne Esplanade на изгибе линии: заливка 4x4, ободок ближе обычного.
+        # Без неё бот тянул Kerk -> Centrum, и игра раз за разом не принимала перегон.
+        img = load_image("belgian_tiny_station_on_bend.png")
+        stations = bot.find_stations(img)
+        for st in ((410, 416.5), (456.5, 356), (467, 466.5)):     # Esplanade, Centrum, Kerk
+            self.assertTrue(any(np.hypot(s[0] - st[0], s[1] - st[1]) < 3 for s in stations), st)
+
+    def test_goal_ring_found_when_camera_centred_by_button(self):
+        # Кнопка Goal ставит станцию в центр экрана; внутри кольца тогда название
+        # станции и синий значок - кольцо всё равно должно находиться.
+        img = load_image("belgian_goal_centred_by_button.png")
+        ring = bot.find_ring_ex(img, bot.C_RED)
+        self.assertIsNotNone(ring)
+        np.testing.assert_allclose(ring[:2], (960, 505), atol=3)
+
+    def test_map_motion_is_measured_from_the_map(self):
+        # Расчёт сдвига и масштаба расходится с картой (предел масштаба, неточная протяжка),
+        # поэтому бот меряет движение карты по ней самой.
+        img = load_image("belgian_route_end_offscreen.png")
+        h, w = img.shape[:2]
+        _, hdr = bot.ui_state(img)
+        rects = bot.ui_rects(w, h, hdr)
+        for M in (bot.M_shift((60, -45)), bot.M_zoom((900, 400), 1.38)):
+            moved = cv2.warpAffine(img, M, (w, h), borderValue=bot.C_BG)
+            meas, n = bot.map_motion(img, moved, rects)
+            self.assertIsNotNone(meas)
+            self.assertGreaterEqual(n, 40)
+            for p in ((400, 300), (1000, 600)):
+                np.testing.assert_allclose(bot.M_apply(meas, p), bot.M_apply(M, p), atol=3)
+            self.assertTrue(bot.motion_agrees(meas, n, M, w, h))
+
+    def test_route_tip_found_at_min_zoom(self):
+        # Камера на Goal (кнопкой) и карта отдалена до предела: кольца почти не видно,
+        # а конец красного маршрута - где сейчас гость - виден. Значки K не в счёт.
+        img = load_image("belgian_min_zoom_route_tip.png")
+        _, hdr = bot.ui_state(img)
+        rects = bot.ui_rects(img.shape[1], img.shape[0], hdr)
+        np.testing.assert_allclose(bot.route_tip(img, rects, (960, 505)), (1205, 260), atol=4)
+
     def test_no_start_or_goal_ring_without_task(self):
         for name in self.ROUTES:
             with self.subTest(image=name):
