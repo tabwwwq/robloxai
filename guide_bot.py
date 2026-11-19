@@ -31,6 +31,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 from ctypes import wintypes
 
 import cv2
@@ -125,6 +126,10 @@ class Game:
         self.sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
         self.paused = False
         self._f8 = False
+        # Windows помнит «нажата с прошлого опроса» с тех пор, как клавишу нажимали где угодно.
+        # P в русской раскладке - буква «з»: после «запусти» в чате бот сразу вставал на паузу.
+        for vk in (VK_P, VK_O, VK_F8, VK_F10):
+            user32.GetAsyncKeyState(vk)
         self.hwnd = None
         self.find_window()
 
@@ -1017,6 +1022,94 @@ def light_dot_near(img, pt, rad=9):
     return best and best[1]
 
 
+C_ROUTE = (215, 40, 40)      # уже проложенный маршрут гостя - ярко-красный поверх тусклой линии
+
+
+def route_cover(img, seg, a, b):
+    """Какая доля участка пути seg между станциями a и b уже закрашена ярко-красным
+    маршрутом. -> 0..1 или None (участок слишком короткий). Так видно, что игра приняла
+    перегон, даже когда метки Current над станцией нет (в игре её бывает не видно)."""
+    h, w = img.shape[:2]
+    red = cmask(img, C_ROUTE, 24)
+    gap = min(10.0, 0.25 * math.hypot(b[0] - a[0], b[1] - a[1]))   # кружки станций не считаем
+    n = hit = 0
+    for x, y in seg:
+        if math.hypot(x - a[0], y - a[1]) < gap or math.hypot(x - b[0], y - b[1]) < gap:
+            continue
+        xi, yi = int(x), int(y)
+        if not (0 <= xi < w and 0 <= yi < h):
+            continue
+        n += 1
+        if red[max(0, yi - 2):yi + 3, max(0, xi - 2):xi + 3].any():
+            hit += 1
+    return hit / n if n >= 3 else None
+
+
+LEG_DONE = 0.85      # участок закрашен почти целиком - перегон уже проложен
+
+
+def leg_drawn(before, after):
+    """Перегон закрашен после протяжки. До протяжки часть участка тоже бывает красной:
+    значок K на линии и красные полоски поезда, поэтому достаточно заметного прироста."""
+    return after is not None and after >= LEG_DONE and after - (before or 0.0) >= 0.2
+
+
+def route_end(img, start, stations):
+    """Конец уже проложенного (ярко-красного) маршрута от станции Start - текущая станция.
+    Нужна, когда метки Current не видно.
+    -> (станция или None, самая дальняя от Start точка маршрута или None, если маршрута нет).
+    Станции нет, а дальняя точка есть - конец маршрута не виден (под окном, за краем)."""
+    h, w = img.shape[:2]
+    f = 2
+    gw, gh = w // f, h // f
+    # поезд на уже проложенном участке закрывает красное, остаются полоски по краям вагонов -
+    # расширяем, чтобы маршрут не рвался на поезде
+    red = cv2.resize(cv2.dilate(cmask(img, C_ROUTE, 24), np.ones((7, 7), np.uint8)), (gw, gh),
+                     interpolation=cv2.INTER_AREA) > 0
+    ok = red.copy()
+    disks = []
+    for cx, cy, r in stations:       # кружок станции рвёт красную линию - через него можно пройти
+        d = np.zeros((gh, gw), np.uint8)
+        cv2.circle(d, (int(cx / f), int(cy / f)), int(math.ceil((r + 3) / f)), 1, -1)
+        disks.append(d > 0)
+        ok |= disks[-1]
+    seed = np.zeros((gh, gw), np.uint8)
+    cv2.circle(seed, (int(start[0] / f), int(start[1] / f)), int(math.ceil(9 / f)), 1, -1)
+    seed = (seed > 0) & ok
+    if not (seed & red).any():
+        return None, None            # от Start маршрут ещё не начат
+    dist = np.full((gh, gw), -1, np.int32)
+    q = deque()
+    for y, x in zip(*np.nonzero(seed)):
+        dist[y, x] = 0
+        q.append((y, x))
+    while q:
+        y, x = q.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < gh and 0 <= nx < gw and ok[ny, nx] and dist[ny, nx] < 0:
+                    dist[ny, nx] = dist[y, x] + 1
+                    q.append((ny, nx))
+    dmax = int(dist.max())
+    fy, fx = np.unravel_index(int(dist.argmax()), dist.shape)
+    far_pt = ((fx + 0.5) * f, (fy + 0.5) * f)
+    if dmax * f < 20:
+        return None, None            # красное у Start - не маршрут (значок K, поезд)
+    best = None
+    for (cx, cy, _), d in zip(stations, disks):
+        if math.hypot(cx - start[0], cy - start[1]) < 12 or not (d & red).any():
+            continue
+        far = int(dist[d].max())
+        if far > 0 and (best is None or far > best[0]):
+            best = (far, (cx, cy))
+    # Красное тянется заметно дальше последней видимой станции: конец маршрута под
+    # интерфейсом, за краем экрана или станцию под ним не узнали - не угадываем.
+    if not best or best[0] * f < 20 or (dmax - best[0]) * f > 14:
+        return None, far_pt
+    return best[1], far_pt
+
+
 def find_current(img, stations, rects, scale):
     """Станция под синей меткой Current (докуда уже построен маршрут).
     Если сам кружок не распознан (стоит поезд), берём точку под остриём метки."""
@@ -1123,8 +1216,18 @@ def app_dir():
     return os.path.dirname(os.path.abspath(base))
 
 
+LOG_FILE = None      # с --debug лог пишется ещё и в debug/log.txt: окно бота могут закрыть
+
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if LOG_FILE is not None:
+        try:
+            LOG_FILE.write(line + "\n")
+            LOG_FILE.flush()
+        except OSError:
+            pass
 
 
 def save_png(path, img_bgr):
@@ -1156,6 +1259,18 @@ class View:
         self.G, self.g_exact = self._snap(self.G, g_exact)
         self.R, self.r_exact = self._snap(self.R, r_exact)
         self.cur = find_current(img, self.stations, self.rects, self.scale)
+        self.cur_by_route = False
+        self.route_far = None         # докуда тянется красный маршрут, если его конец не узнан
+        start = self.G or self.G_raw
+        if self.cur is None and start is not None:
+            # метки Current нет - текущая станция там, где кончается красный маршрут
+            self.cur, self.route_far = route_end(img, start, self.stations)
+            if self.cur is None and self.route_far is not None:
+                # станции в конце красного маршрута не узнали (мелкий масштаб, поезд) -
+                # гость там, где кончается красное. Если это место под окном или за краем,
+                # бот сначала сдвинет карту, а не потянет от середины маршрута.
+                self.cur = self.route_far
+            self.cur_by_route = self.cur is not None
 
     def _marker(self, col):
         p, exact = find_marker(self.img, col)
@@ -1349,10 +1464,13 @@ class Bot:
                 return False
             sym = False
         else:
-            sym = True      # игра ставит Start и Goal симметрично относительно центра экрана
+            # в начале задания игра ставит Start и Goal симметрично относительно центра экрана;
+            # в повторной попытке камеру уже двигал бот - так угадывать нельзя
+            sym = self.tries <= 1
         self.dbg_rgb("task", v.img)
         self.vlog(f"Start {v.G} {'кольцо' if v.g_exact else 'булавка'}, Goal {v.R} "
-                  f"{'кольцо' if v.r_exact else 'булавка'}, станций {len(v.stations)}")
+                  f"{'кольцо' if v.r_exact else 'булавка'}, станций {len(v.stations)}, "
+                  f"Current {v.cur} {'(конец маршрута)' if v.cur_by_route else ''}")
         est = {}            # последние известные координаты: start, goal, cur
         had_undo = False
         cols_seen = list(self.city["line"])   # цвета линии: известный для карты + найденные
@@ -1381,7 +1499,24 @@ class Bot:
                     est["goal"] = (v.w - est["start"][0], v.h - est["start"][1])
                 elif "goal" in est and "start" not in est:
                     est["start"] = (v.w - est["goal"][0], v.h - est["goal"][1])
-            src = est.get("cur") or est.get("start")
+            src = est.get("cur")
+            if src is None and had_undo:
+                # Маршрут уже начат, а где он кончается, не видно. Тянуть от Start нельзя:
+                # протяжка от станции посреди маршрута обрезает его. Ищем конец маршрута.
+                look = v.route_far or est.get("start")
+                if look is not None:
+                    self.vlog(f"не вижу, где кончается маршрут - смотрю туда {look}")
+                    sx0, sy0, sx1, sy1 = v.safe
+                    vec = ((sx0 + sx1) / 2 - look[0], (sy0 + sy1) / 2 - look[1])
+                    moved = self.pan(v, vec) if math.hypot(*vec) >= 20 else (0, 0)
+                    if math.hypot(*moved) < 10:
+                        fails += 1
+                    else:
+                        est = {k: (p[0] + moved[0], p[1] + moved[1]) for k, p in est.items()}
+                    v = self.wait_still(need_ring=False)
+                    continue
+            elif src is None:
+                src = est.get("start")
             dst = est.get("goal")
             if src is None or dst is None:     # одна из станций где-то за экраном - отдаляем карту
                 searches += 1
@@ -1486,6 +1621,15 @@ class Bot:
             for i in range(legs):
                 a, b = route[i], route[i + 1]
                 last = i == len(route) - 2
+                seg = plan.path[plan.idx[i]:plan.idx[i + 1] + 1]
+                before = route_cover(v.img, seg, a, b)
+                if not last and before is not None and before >= LEG_DONE:
+                    # перегон уже проложен (в прошлой попытке): повторная протяжка
+                    # обрезала бы маршрут - просто идём дальше
+                    self.vlog(f"перегон {i + 1} уже проложен - дальше")
+                    had_undo = True
+                    est["cur"] = b
+                    continue
                 g.drag(a, b)
                 g.glide(b[0], int(min(v.safe[3], b[1] + 70 * v.scale)), step=30)  # курсор прочь со станции
                 g.sleep(0.25)
@@ -1499,12 +1643,14 @@ class Bot:
                     ok = False
                 else:
                     # метка Current летит к новой станции; на длинном перегоне (Belgian Coast
-                    # на крупном масштабе) это дольше полсекунды - ждём её до 1.2 с
+                    # на крупном масштабе) это дольше полсекунды - ждём её до 1.2 с.
+                    # Метки бывает не видно совсем - тогда смотрим, закрасился ли перегон.
                     t_end = time.time() + 1.2
                     while True:
                         ring1 = find_marker(img, C_RED)
                         moved = ring1[0] is not None and marker_moved(ring0, ring1)
-                        if not moved and has_blue_pin(img, b, v.scale):
+                        if not moved and (has_blue_pin(img, b, v.scale)
+                                          or leg_drawn(before, route_cover(img, seg, a, b))):
                             break
                         if time.time() >= t_end:
                             ok = False
@@ -1518,7 +1664,10 @@ class Bot:
                         self.vlog(f"перегон {i + 1}: на станции стоит поезд - жду, пока уедет")
                         g.sleep(0.8)
                     else:
-                        self.vlog(f"перегон {i + 1} не засчитан - смотрю заново")
+                        cov = route_cover(img, seg, a, b)
+                        self.vlog(f"перегон {i + 1} не засчитан - смотрю заново (закрашено "
+                                  f"{'-' if before is None else f'{before:.2f}'} -> "
+                                  f"{'-' if cov is None else f'{cov:.2f}'})")
                         self.dbg_rgb("seg_fail", img)
                         fails += 1
                     break
@@ -1779,6 +1928,14 @@ def main():
             return
     print(BANNER, flush=True)
     k32.SetConsoleTitleW("Guide Bot  |  P - пауза, O - выход")
+    if args.debug:
+        global LOG_FILE
+        try:
+            os.makedirs(os.path.join(app_dir(), "debug"), exist_ok=True)
+            LOG_FILE = open(os.path.join(app_dir(), "debug", "log.txt"), "a", encoding="utf-8")
+            LOG_FILE.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} запуск =====\n")
+        except OSError:
+            LOG_FILE = None
     if args.city:
         key = CITY_ALIASES.get(args.city.strip().lower())
         if not key:

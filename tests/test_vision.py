@@ -348,6 +348,56 @@ class BelgianCoastTests(unittest.TestCase):
         self.assertEqual(legs, 0)                        # сначала сдвинуть карту, а не тянуть
         self.assertLess(trouble[1], 245)
 
+    def test_leg_accepted_without_current_pin(self):
+        # В игре пропали метки Start/Current над станциями. Перегон Heist Duinbergen ->
+        # Heist Kerk игра приняла (закрашен красным, Your route: 1 stops), а бот ждал синюю
+        # метку и считал перегон не засчитанным - и тянул его снова и снова.
+        img = load_image("belgian_no_pins_leg_drawn.png")
+        _, hdr = bot.ui_state(img)
+        view = bot.View(img, hdr)
+        start, kerk, next_st = (1152, 298), (1086, 370), (1033, 423)
+        self.assertEqual(bot.blue_pins(img, view.scale), [])
+        np.testing.assert_allclose(view.G, start, atol=2)
+        np.testing.assert_allclose(view.cur, kerk, atol=2)     # конец красного маршрута
+        self.assertTrue(view.cur_by_route)
+
+        def line(p, q):
+            return [(p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t) for t in np.linspace(0, 1, 30)]
+
+        self.assertTrue(bot.leg_drawn(0.0, bot.route_cover(img, line(start, kerk), start, kerk)))
+        self.assertFalse(bot.leg_drawn(0.0, bot.route_cover(img, line(kerk, next_st), kerk, next_st)))
+
+    def test_no_route_end_before_the_route_starts(self):
+        img = load_image("belgian_task_start.png")
+        _, hdr = bot.ui_state(img)
+        view = bot.View(img, hdr)
+        self.assertEqual(bot.route_end(img, view.G_raw, view.stations), (None, None))
+
+    def test_leg_with_k_badge_counts_as_drawn(self):
+        # На перегоне Koksijde Lejeunelaan -> Schipgat стоит красный значок K: ещё до
+        # протяжки участок был закрашен на 0.71, и прирост до 1.0 бот не засчитывал.
+        img = load_image("belgian_leg_past_k_badge.png")
+        _, hdr = bot.ui_state(img)
+        view = bot.View(img, hdr)
+        a, b = (788, 477), (845, 418)
+        seg = [(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t) for t in np.linspace(0, 1, 30)]
+        self.assertTrue(bot.leg_drawn(0.71, bot.route_cover(img, seg, a, b)))
+        self.assertFalse(bot.leg_drawn(0.71, 0.75))
+        np.testing.assert_allclose(view.cur, b, atol=2)       # конец красного маршрута
+
+    def test_route_end_off_screen_is_not_guessed(self):
+        # Маршрут из 7 перегонов уходит за верхний край: конца не видно, и бот не должен
+        # тянуть от Start или от середины маршрута - это обрезало бы маршрут.
+        img = load_image("belgian_route_end_offscreen.png")
+        _, hdr = bot.ui_state(img)
+        view = bot.View(img, hdr)
+        self.assertIsNotNone(view.route_far)
+        self.assertLess(view.route_far[1], 200)               # дальняя точка - у верхнего края
+        # гость там, где кончается красное, а это место под верхней панелью:
+        # бот сначала сдвинет карту, а не потянет перегон
+        self.assertEqual(view.cur, view.route_far)
+        self.assertFalse(view.clear(view.cur))
+
     def test_no_start_or_goal_ring_without_task(self):
         for name in self.ROUTES:
             with self.subTest(image=name):
