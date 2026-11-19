@@ -1622,13 +1622,6 @@ class Bot:
 
         return bool(ends) and not any(has_station(p, ok) for p, ok in ends)
 
-    def click_dialog(self, hdr, which):
-        """Кнопки Start / Goal в окне задания - камера встаёт на эту станцию, в центр экрана,
-        масштаб не меняется (проверено в игре)."""
-        fx = 0.559 if which == "start" else 0.735
-        self.g.click(int(hdr["x"] + fx * hdr["w"]), int(hdr["y"] + 3.47 * hdr["h"]))
-        self.g.park()
-
     def follow(self, est, old, expected, need_ring=False):
         """Ждём, пока карта встанет, и переносим est на новый кадр. Насколько на самом деле
         сдвинулась и приблизилась карта, меряем по ней самой: расчёт (ZOOM_STEP, длина
@@ -1648,103 +1641,53 @@ class Bot:
                           f"совпадений {n}")
         return nv, {k: M_apply(M, p) for k, p in est.items()}
 
-    def center_on(self, v, which):
-        """Кнопка Start/Goal: камера встаёт на станцию в центр экрана.
-        -> (View, координаты станции) или (None, None)."""
-        self.vlog(f"кнопка {'Start' if which == 'start' else 'Goal'}: ставлю камеру на станцию")
-        self.click_dialog(v.hdr, which)
-        self.g.sleep(0.5)
-        nv = self.wait_still(need_ring=False)
-        if nv is None:
-            return None, None
-        c = (nv.w / 2, nv.h / 2)
-        raw = nv.G_raw if which == "start" else nv.R_raw
-        pos = raw if raw is not None and math.hypot(raw[0] - c[0], raw[1] - c[1]) <= 40 else c
-        return nv, pos
+    def search_out(self, v, est, started):
+        """Найти Start, Goal и (если маршрут начат) место гостя без кнопок Start/Goal:
+        отдаляем карту вокруг середины экрана, пока они не появятся. Камера не прыгает,
+        поэтому то, что уже известно (est), переносится на новый кадр по измерению карты.
+        На самом мелком масштабе кольца бледные - ищем и такие. -> (View или None, est)."""
+        self.vlog("ищу Start и Goal: отдаляю карту")
 
-    def jump_to(self, v, est, which):
-        """Кнопка Start/Goal и перенос est на новый кадр: камера только сдвигается, поэтому
-        остальные точки сдвигаются на столько же, на сколько сама станция (если её положение
-        до прыжка было известно) или как измерено по карте (если кадры перекрываются).
-        -> (View или None, est)."""
-        key = "start" if which == "start" else "goal"
-        old = est.get(key)
-        nv, pos = self.center_on(v, which)
-        if nv is None:
-            return None, est
-        meas, n = map_motion(v.img, nv.img, v.rects)
-        if old is not None:
-            exp = M_shift((pos[0] - old[0], pos[1] - old[1]))
-            M = meas if meas is not None and motion_agrees(meas, n, exp, v.w, v.h) else exp
-            est = {k: M_apply(M, p) for k, p in est.items()}
-        elif meas is not None and n >= 40:
-            est = {k: M_apply(meas, p) for k, p in est.items()}
-        else:
-            est = {}
-        est[key] = pos
-        return nv, est
-
-    def relocate(self, v, anchor="goal"):
-        """Найти Start и Goal заново. Кнопка ставит камеру на одну станцию (anchor) в центр
-        экрана, потом отдаляем карту вокруг неё (она остаётся на месте), пока не появится
-        вторая. На самом мелком масштабе кольца бледные - ищем и такие.
-        -> (View, est) или (None, {})."""
-        other = "start" if anchor == "goal" else "goal"
-        self.vlog(f"ищу Start и Goal: кнопка {anchor}, потом отдаляю карту вокруг неё")
-        started = bool(v.hdr) and self.undo_visible(v.img, v.hdr)
-        v, here = self.center_on(v, anchor)
-        if v is None:
-            return None, {}
-
-        def find_other(v):
-            raw = v.G_raw if other == "start" else v.R_raw
+        def ring(v, col, raw):
             if raw is not None:
                 return raw
-            fr = find_ring_ex(v.img, C_GREEN if other == "start" else C_RED, faint=True)
-            if fr is not None and fr[3] >= 0.5 and not v.blocked(fr[:2], 0) \
-                    and math.hypot(fr[0] - here[0], fr[1] - here[1]) > 40:
+            if len(v.stations) > 6:          # бледные кольца ищем только на мелком масштабе
+                return None
+            fr = find_ring_ex(v.img, col, faint=True)
+            if fr is not None and fr[3] >= 0.5 and not v.blocked(fr[:2], 0):
                 return (fr[0], fr[1])
             return None
 
-        tip = None
-        found = find_other(v)
-        for _ in range(5):
-            if found is not None:
+        for step in range(8):
+            S = ring(v, C_GREEN, v.G_raw)
+            R = ring(v, C_RED, v.R_raw)
+            if S is not None and R is not None and math.hypot(S[0] - R[0], S[1] - R[1]) < 20:
+                R = v.R_raw                      # одно и то же кольцо - не верим бледному
+            if S is not None:
+                est["start"] = S
+            if R is not None:
+                est["goal"] = R
+            if started and "cur" not in est:
+                if v.cur is not None:
+                    est["cur"] = v.cur
+                elif S is not None:
+                    c4, far4 = route_end(v.img, S, v.stations)
+                    if c4 is not None or far4 is not None:
+                        est["cur"] = c4 or far4
+                if "cur" not in est and R is not None:
+                    tip = route_tip(v.img, v.rects, R)
+                    if tip is not None and not v.blocked(tip, 20):
+                        est["cur"] = tip
+            if "goal" in est and ("cur" in est if started else "start" in est):
                 break
-            if started and anchor == "goal":
-                # маршрут уже начат: Start не нужен, хватит конца красного маршрута у Goal.
-                # Конец у самого окна задания или края экрана - настоящий конец, скорее всего,
-                # под ним: отдаляем ещё, тогда маршрут выйдет к Goal в центр экрана
-                tip = route_tip(v.img, v.rects, here)
-                if tip is not None and not v.blocked(tip, 20):
-                    break
-                tip = None
-            a, z = self.zoom(here, -3)
-            v, h2 = self.follow({"here": here}, v, M_zoom(a, z))
+            if step > 0 and self.last_scale is not None and self.last_scale > 0.97:
+                break                            # карта уже отдалена до предела
+            a, z = self.zoom_out(v, 3)
+            v, est = self.follow(est, v, M_zoom(a, z))
             if v is None:
-                return None, {}
-            here = h2["here"]
-            own = v.R_raw if anchor == "goal" else v.G_raw
-            if own is not None and math.hypot(own[0] - here[0], own[1] - here[1]) <= 40:
-                here = own
-            found = find_other(v)
-        est = {anchor: here}
-        if found is not None:
-            est[other] = found
-        start = est.get("start")
-        if started:
-            if v.cur is not None:
-                est["cur"] = v.cur
-            elif start is not None:
-                c4, far4 = route_end(v.img, start, v.stations)
-                if c4 is not None or far4 is not None:
-                    est["cur"] = c4 or far4
-            if "cur" not in est and "goal" in est:
-                tip = tip or route_tip(v.img, v.rects, est["goal"])
-                if tip is not None:
-                    est["cur"] = tip
+                return None, est
         self.vlog(f"нашёл: Goal {est.get('goal')}, Start {est.get('start')}, Current {est.get('cur')}")
-        self.dbg_rgb("relocate", v.img)
+        self.dbg_rgb("search", v.img)
         return v, est
 
     # ---- одно задание ----
@@ -1756,13 +1699,11 @@ class Bot:
             st, hdr = ui_state(g.grab())
             if st != "task":
                 return True
-            self.vlog("не вижу колец - навожу камеру кнопкой Start")
-            self.click_dialog(hdr, "start")
-            v = self.wait_still()
-            if v is None:
-                log("Не вижу станции Start и Goal")
-                self.dbg_rgb("no_rings", g.grab())
-                return False
+            # колец не видно (мелкий масштаб, под интерфейсом) - смотрим карту как есть,
+            # дальше бот сам отдалит её и найдёт Start и Goal
+            self.vlog("не вижу колец - буду искать, отдаляя карту")
+            img = g.grab()
+            v = View(img, hdr)
             sym = False
         else:
             # в начале задания игра ставит Start и Goal симметрично относительно центра экрана;
@@ -1802,16 +1743,6 @@ class Bot:
                     est["goal"] = (v.w - est["start"][0], v.h - est["start"][1])
                 elif "goal" in est and "start" not in est:
                     est["start"] = (v.w - est["goal"][0], v.h - est["goal"][1])
-            if (not had_undo and not centred and v.hdr and est.get("cur") is None
-                    and (v.G is None or not v.g_exact)):
-                # Маршрут не начат, а Start виден не точно (под окном задания, только примерно).
-                # Кнопка Start ставит его ровно в центр экрана; камера только сдвигается,
-                # поэтому Goal сдвигается на столько же.
-                centred = True
-                nv, est = self.jump_to(v, est, "start")
-                if nv is not None:
-                    v = nv
-                    continue
             src = est.get("cur")
             if src is None and had_undo and v.R_raw is not None and not tip_failed:
                 # Start не видно, Goal виден: гость там, где красный маршрут ближе всего к Goal
@@ -1830,13 +1761,13 @@ class Bot:
                     est["trace"] = far2
             if src is None and had_undo and v.G is None and "trace" not in est and v.hdr \
                     and not start_shown:
-                # Маршрут начат, Start не виден: кнопка Start ставит его в центр, и оттуда
-                # бот пойдёт по красному маршруту к его концу
+                # Маршрут начат, Start не виден: отдаляем карту, пока не увидим Start или конец
+                # маршрута; оттуда бот пойдёт по красному маршруту к его концу
                 start_shown = True
                 relocations += 1
-                nv, nest = self.relocate(v, "start")
+                nv, est = self.search_out(v, est, True)
                 if nv is not None:
-                    v, est, zoom_ins = nv, nest, 0
+                    v, zoom_ins = nv, 0
                     continue
             if src is None and had_undo:
                 # Маршрут уже начат, а где он кончается, не видно. Тянуть от Start нельзя:
@@ -1878,6 +1809,7 @@ class Bot:
                 # Goal по расчёту прямо на виду, а кольца там нет: расчёт разошёлся с картой
                 # (масштаб меняется не ровно на ZOOM_STEP, сдвиг карты бывает неточным).
                 self.vlog(f"Goal не там, где ждал ({dst[0]:.0f}, {dst[1]:.0f}) - ищу заново")
+                est.pop("goal", None)
                 dst = None
             if (dst is None and src is not None and had_undo and relocations >= 2
                     and est.get("start") is not None):
@@ -1893,13 +1825,12 @@ class Bot:
                 # на Goal в центр экрана; отдаляя карту вокруг неё, находим и Start.
                 if v.hdr and relocations < 4:
                     relocations += 1
-                    # первый раз - от Goal; не нашли Start или Current - от Start
-                    nv, nest = self.relocate(v, "goal" if relocations % 2 == 1 else "start")
+                    nv, est = self.search_out(v, est, had_undo)
                     if nv is None:
                         fails += 1
                         v = None
                         continue
-                    v, est, zoom_ins = nv, nest, 0       # камера прыгнула: старые координаты не годятся
+                    v, zoom_ins = nv, 0
                     continue
                 searches += 1                # окна задания не видно - просто отдаляем карту
                 if searches > 8:
