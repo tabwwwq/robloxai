@@ -632,11 +632,14 @@ def find_gold_stations(img):
     cv2.drawContours(gold, contours, -1, 255, cv2.FILLED)
     ang = np.linspace(0, 2 * np.pi, 32, endpoint=False)
     out = []
-    for b in blobs(gold, 10):
-        if not (5 <= b["w"] <= 32 and 5 <= b["h"] <= 32 and abs(b["w"] - b["h"]) <= 2):
+    for b in blobs(gold, 6):
+        # на самом крупном масштабе золотой кружок - около 40 px, на мелком - 4 px
+        if not (3 <= b["w"] <= 48 and 3 <= b["h"] <= 48 and abs(b["w"] - b["h"]) <= 2):
             continue
-        if b["area"] < 0.6 * b["w"] * b["h"]:
+        # у крошечной точки часть заливки занимает светлая цифра - заполненность ниже
+        if b["area"] < (0.45 if max(b["w"], b["h"]) <= 6 else 0.55) * b["w"] * b["h"]:
             continue
+        tiny = max(b["w"], b["h"]) < 5      # только мягкая проверка с линией метро
         cx, cy = b["x"] + (b["w"] - 1) / 2, b["y"] + (b["h"] - 1) / 2
         rr = (b["w"] + b["h"]) / 4 + 0.5
         rim = np.zeros(32, bool)
@@ -648,8 +651,29 @@ def find_gold_stations(img):
             # На маленьком масштабе светлый ободок смешивается с тёмным фоном;
             # порог 175 терял станцию из-за одного пикселя рядом с поездом.
             rim |= neutral & ((px.max(1) < 100) if light else (px.min(1) >= 140))
-        if rim.sum() >= 20:
+        if rim.sum() >= 20 and not tiny:
             out.append((cx, cy, rr + 0.5))
+        elif max(b["w"], b["h"]) <= 8 and not light:
+            # Маленькая золотая станция (заливка 6x6): обводка тонкая и тусклая (~97), на rr
+            # видна лишь половина. Берём её мягче, но только если к ней примыкает линия метро -
+            # иначе так же выглядели бы мелкие жёлтые значки.
+            rim2 = np.zeros(32, bool)
+            for q in (rr - 0.5, rr, rr + 0.5):
+                xs = np.clip(np.round(cx + q * np.cos(ang)).astype(int), 0, w - 1)
+                ys = np.clip(np.round(cy + q * np.sin(ang)).astype(int), 0, h - 1)
+                px = img[ys, xs].astype(int)
+                rim2 |= (px.max(1) - px.min(1) <= 40) & (px.min(1) >= 85)
+            if rim2.sum() >= 14:
+                line = 0
+                for q in (rr + 2.0, rr + 3.0):
+                    xs = np.clip(np.round(cx + q * np.cos(ang)).astype(int), 0, w - 1)
+                    ys = np.clip(np.round(cy + q * np.sin(ang)).astype(int), 0, h - 1)
+                    px = img[ys, xs].astype(int)
+                    # цветная линия (тёмно-красная днём и ночью), не фон, не текст, не золото
+                    col = (px.max(1) - px.min(1) >= 20) & (px[:, 0] > px[:, 1] + 15) & (px[:, 1] < 100)
+                    line = max(line, int(col.sum()))
+                if line >= 2:
+                    out.append((cx, cy, rr + 0.5))
     return out
 
 
@@ -939,6 +963,28 @@ def motion_agrees(meas, n, expected, w, h):
     close = 0.85 <= sm / se <= 1.18 and off <= max(80.0, 0.4 * far)
     wide = 0.6 <= sm / se <= 1.4 and off <= max(250.0, 0.8 * far)
     return (n >= 20 and close) or (n >= 40 and wide)
+
+
+def free_spot(img, at, rects, radius=140):
+    """Ближайшая к at точка пустой карты: без надписей, значков, станций и интерфейса.
+    Колесо мыши над значком станции или надписью карту не масштабирует - событие
+    забирает кнопка интерфейса. -> (x, y)."""
+    h, w = img.shape[:2]
+    if is_light(img):
+        busy = (img.min(axis=2) < 200).astype(np.uint8)
+    else:
+        busy = (img.max(axis=2) >= 100).astype(np.uint8)
+    busy = cv2.dilate(busy, np.ones((21, 21), np.uint8))
+    best = None
+    for dy in range(-radius, radius + 1, 10):
+        for dx in range(-radius, radius + 1, 10):
+            x, y = int(at[0] + dx), int(at[1] + dy)
+            if not (0 <= x < w and 0 <= y < h) or busy[y, x] or is_blocked((x, y), rects, w, h, 24):
+                continue
+            d = dx * dx + dy * dy
+            if best is None or d < best[0]:
+                best = (d, (x, y))
+    return best[1] if best else at
 
 
 def ready_legs(plan, view, goal_ok):
@@ -1593,11 +1639,14 @@ class Bot:
         -> (точка, вокруг которой менялся масштаб; во сколько раз изменились расстояния)."""
         g = self.g
         g.wait_ready()
+        img = g.grab()
+        st, hdr = ui_state(img)
+        at = free_spot(img, at, ui_rects(img.shape[1], img.shape[0], hdr if st == "task" else None))
         g.glide(int(at[0]), int(at[1]))
         time.sleep(0.05)
         g._jiggle()
         ax, ay = g.cursor()
-        self.vlog(f"{'приближаю' if clicks > 0 else 'отдаляю'} карту на {abs(clicks)} щелчков")
+        self.vlog(f"{'приближаю' if clicks > 0 else 'отдаляю'} карту на {abs(clicks)} щелчков у ({ax}, {ay})")
         delta = 120 if clicks > 0 else -120
         for _ in range(abs(clicks)):
             inp = INPUT(type=0)
@@ -1651,10 +1700,10 @@ class Bot:
         def ring(v, col, raw):
             if raw is not None:
                 return raw
-            if len(v.stations) > 6:          # бледные кольца ищем только на мелком масштабе
-                return None
+            # бледное кольцо на самом мелком масштабе - радиус около 31 px; прокачанные
+            # (золотые) станции видны и там, поэтому по числу станций масштаб не понять
             fr = find_ring_ex(v.img, col, faint=True)
-            if fr is not None and fr[3] >= 0.5 and not v.blocked(fr[:2], 0):
+            if fr is not None and fr[3] >= 0.6 and 24 <= fr[2] <= 40 and not v.blocked(fr[:2], 0):
                 return (fr[0], fr[1])
             return None
 
@@ -1686,6 +1735,25 @@ class Bot:
             v, est = self.follow(est, v, M_zoom(a, z))
             if v is None:
                 return None, est
+        # Не нашли - то, что ищем, может быть под окном задания или панелью: сдвигаем карту
+        # вверх, вниз и в стороны и смотрим, что под интерфейсом
+        for vec in ((0, -330), (0, 600), (330, -270), (-600, 0)):
+            if "goal" in est and ("cur" in est if started else "start" in est):
+                break
+            moved = self.pan(v, vec)
+            if math.hypot(*moved) < 10:
+                continue
+            v, est = self.follow(est, v, M_shift(moved))
+            if v is None:
+                return None, est
+            S = ring(v, C_GREEN, v.G_raw)
+            R = ring(v, C_RED, v.R_raw)
+            if S is not None and (R is None or math.hypot(S[0] - R[0], S[1] - R[1]) >= 20):
+                est["start"] = S
+            if R is not None and (S is None or math.hypot(S[0] - R[0], S[1] - R[1]) >= 20):
+                est["goal"] = R
+            if started and "cur" not in est and v.cur is not None:
+                est["cur"] = v.cur
         self.vlog(f"нашёл: Goal {est.get('goal')}, Start {est.get('start')}, Current {est.get('cur')}")
         self.dbg_rgb("search", v.img)
         return v, est
@@ -1719,6 +1787,7 @@ class Bot:
         fails = searches = train_waits = zoom_ins = relocations = 0
         centred = start_shown = tip_failed = False
         retraces = unzooms = 0
+        last_pan = (0.0, 0.0)
         announced = False
         for _ in range(40):
             if fails >= 6:
@@ -1744,6 +1813,15 @@ class Bot:
                 elif "goal" in est and "start" not in est:
                     est["start"] = (v.w - est["goal"][0], v.h - est["goal"][1])
             src = est.get("cur")
+            start_pt = v.G or v.G_raw or est.get("start")
+            if src is not None and had_undo and start_pt is not None \
+                    and math.hypot(src[0] - start_pt[0], src[1] - start_pt[1]) < 20:
+                # маршрут уже начат, значит гость не на Start: протяжка от Start обрезала бы
+                # маршрут. Ищем его конец по красной линии от Start
+                self.vlog("Current совпал со Start при начатом маршруте - ищу конец маршрута")
+                est.pop("cur", None)
+                est["trace"] = start_pt
+                src = None
             if src is None and had_undo and v.R_raw is not None and not tip_failed:
                 # Start не видно, Goal виден: гость там, где красный маршрут ближе всего к Goal
                 tip = route_tip(v.img, v.rects, v.R_raw)
@@ -1792,6 +1870,11 @@ class Bot:
                         self.vlog("у конца маршрута станций не видно - приближаю карту")
                         a, z = self.zoom(look, 2)
                         v, est = self.follow(est, v, M_zoom(a, z))
+                        if self.last_scale is not None and self.last_scale < 1.08 and v is not None:
+                            self.vlog("предел приближения - возвращаю масштаб на шаг назад")
+                            zoom_ins = 8
+                            a, z = self.zoom(look, -2)
+                            v, est = self.follow(est, v, M_zoom(a, z))
                         continue
                     self.vlog(f"не вижу, где кончается маршрут - смотрю туда {look}")
                     moved = self.pan(v, vec) if math.hypot(*vec) >= 20 else (0, 0)
@@ -1817,7 +1900,7 @@ class Bot:
                 # ведём его дальше по линии в ту же сторону, пока Goal не появится на экране
                 dx, dy = src[0] - est["start"][0], src[1] - est["start"][1]
                 ln = math.hypot(dx, dy)
-                if ln > 30:
+                if ln >= 80:
                     dst = (src[0] + dx / ln * 2500, src[1] + dy / ln * 2500)
                     self.vlog("Goal не нашёл - веду маршрут дальше в ту же сторону")
             if src is None or dst is None:
@@ -1837,6 +1920,8 @@ class Bot:
                     break
                 anchor, z = self.zoom_out(v, 4)
                 v, est = self.follow(est, v, M_zoom(anchor, z))
+                if self.last_scale is not None and self.last_scale > 0.97:
+                    break                    # отдалять дальше некуда - пробуем заново со следующей попытки
                 continue
 
             # у текущей станции не видно кружка станции, и станций на экране мало: карта отдалена
@@ -1943,8 +2028,21 @@ class Bot:
                         ty = min(sy1 - m, max(sy0 + m, cy - (q[1] - src[1]) / 2))
                         vec = (tx - src[0], ty - src[1])
                 moved = (0, 0)
+                self.vlog(f"сдвигаю: Current {src} (подтверждён: {src_ok}), Goal {dst}, мешает {trouble}")
+                ln_v, ln_l = math.hypot(*vec), math.hypot(*last_pan)
+                if (ln_v >= 100 and ln_l >= 100 and unzooms < 3
+                        and vec[0] * last_pan[0] + vec[1] * last_pan[1] < -0.7 * ln_v * ln_l):
+                    # карту двигаем туда-обратно: то, что надо увидеть, по разные стороны
+                    # от интерфейса - отдаляем на шаг, чтобы поместилось всё сразу
+                    unzooms += 1
+                    last_pan = (0.0, 0.0)
+                    self.vlog("карта ходит туда-обратно - отдаляю на шаг")
+                    a, z = self.zoom(src if v.clear(src) else (cx, cy), -2)
+                    v, est = self.follow(est, v, M_zoom(a, z))
+                    continue
                 if math.hypot(*vec) >= 20:
                     moved = self.pan(v, vec)
+                    last_pan = moved
                 if math.hypot(*moved) < 10:
                     fails += 1
                     self.vlog(f"карту не сдвинул (Current подтверждён: {src_ok}, мешает {trouble}) - "
@@ -2010,7 +2108,7 @@ class Bot:
                         g.sleep(0.2)
                         img = g.grab()
                 if not ok:
-                    if train_waits < 40 and (train_near(img, a, v.scale) or train_near(img, b, v.scale)):
+                    if train_waits < 10 and (train_near(img, a, v.scale) or train_near(img, b, v.scale)):
                         # это не ошибка: ждём, пока поезд уедет, и не тратим попытку
                         train_waits += 1
                         self.vlog(f"перегон {i + 1}: на станции стоит поезд - жду, пока уедет")
